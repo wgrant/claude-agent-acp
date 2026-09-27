@@ -250,7 +250,12 @@ import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer, type ToolUpdateMeta } from "./tool-calls/renderer.js";
-import { startTerminalTail, stopTerminalTail, taskOutputPath } from "./terminal-tail.js";
+import {
+  startTerminalTail,
+  stopTerminalTail,
+  tailNextTaskOutput,
+  taskOutputPath,
+} from "./terminal-tail.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 import {
   acceptedPlanToolResult,
@@ -6093,6 +6098,30 @@ export class ClaudeAcpAgent {
           }
           case "user":
           case "assistant": {
+            if (message.type === "assistant" && this.toolCallCapabilities.terminalOutputDelta) {
+              const parentToolUseId = message.parent_tool_use_id;
+              for (const block of message.message.content) {
+                if (
+                  block.type === "tool_use" &&
+                  (block.name === "Bash" || block.name === "PowerShell")
+                ) {
+                  const toolCallId = block.id;
+                  tailNextTaskOutput(toolCallId, message.session_id, (data) =>
+                    sendUpdate({
+                      sessionId: message.session_id,
+                      update: {
+                        sessionUpdate: "tool_call_update",
+                        toolCallId,
+                        _meta: {
+                          terminal_output_delta: { terminal_id: toolCallId, data },
+                          ...(parentToolUseId ? { claudeCode: { parentToolUseId } } : {}),
+                        },
+                      },
+                    }),
+                  );
+                }
+              }
+            }
             // Record the ACP messageId -> SDK uuid mapping for this message
             // (including replays). The consolidated message carries both ids, so
             // this is where we learn the uuid the SDK's rewind/resume APIs key on
