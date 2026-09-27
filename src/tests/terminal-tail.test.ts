@@ -3,7 +3,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { startTerminalTail, stopTerminalTail, taskOutputPath } from "../terminal-tail.js";
+import {
+  startTerminalTail,
+  stopTerminalTail,
+  tailNextTaskOutput,
+  taskOutputPath,
+} from "../terminal-tail.js";
 
 describe("terminal tail", () => {
   const dirs: string[] = [];
@@ -41,5 +46,30 @@ describe("terminal tail", () => {
 
     expect(stopTerminalTail("tool-1")).toBe(true);
     expect(stopTerminalTail("tool-1")).toBe(false);
+  });
+
+  it("matches a call to the next task file created in its session", async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "tail-"));
+    dirs.push(base);
+    vi.stubEnv("CLAUDE_CODE_TMPDIR", base);
+    const uid = process.getuid?.();
+    const tasks = path.join(
+      base,
+      uid === undefined ? "claude" : `claude-${uid}`,
+      "-proj",
+      "sess-2",
+      "tasks",
+    );
+    fs.mkdirSync(tasks, { recursive: true });
+    fs.writeFileSync(path.join(tasks, "bold.output"), "earlier command\n");
+
+    const sent: string[] = [];
+    tailNextTaskOutput("tool-2", "sess-2", async (data) => {
+      sent.push(data);
+    });
+    fs.writeFileSync(path.join(tasks, "a1.output"), "an agent, not a shell\n");
+    fs.writeFileSync(path.join(tasks, "bnew.output"), "tick 1\n");
+    await vi.waitFor(() => expect(sent.join("")).toBe("tick 1\n"));
+    expect(stopTerminalTail("tool-2")).toBe(true);
   });
 });
