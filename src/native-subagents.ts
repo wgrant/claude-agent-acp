@@ -444,6 +444,17 @@ export class NativeSubagentRuntime {
     );
   }
 
+  /** Give a child with no spawning tool call (a forked skill) a synthetic
+   *  parent id, so updates stamped with it route to the child's session. */
+  adoptOrphan(taskId: string): string | undefined {
+    const child = this.children.get(taskId);
+    if (!this.enabled || !child || child.parentToolUseId) return undefined;
+    const parentToolUseId = `fork:${taskId}`;
+    child.parentToolUseId = parentToolUseId;
+    this.childByParentToolUse.set(parentToolUseId, child);
+    return parentToolUseId;
+  }
+
   /**
    * The SDK reports in a SendMessage result that the call `toolUseId`, with
    * the message `prompt`, resumed the agent `taskId`. AIR's draft treats it as
