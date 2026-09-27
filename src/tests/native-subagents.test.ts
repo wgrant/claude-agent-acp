@@ -391,11 +391,24 @@ describe("NativeSubagentRuntime lifecycle", () => {
   });
 
   it("routes a teammate woken by SendMessage to its new generation", async () => {
-    const runtime = new NativeSubagentRuntime(true, "root", {}, async () => {}, { log: () => {} });
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      true,
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+    );
     const launch = (toolCallId: string) =>
       ({
         ...control("tool_call", "pending"),
-        update: { ...control("tool_call", "pending").update, toolCallId },
+        update: {
+          ...control("tool_call", "pending").update,
+          toolCallId,
+          rawInput: { name: "tester", description: "Wait for bugs", prompt: "Wait" },
+        },
       }) as AcpSessionNotification;
     // The teammate's own output keeps naming the Agent call that spawned it.
     const output = (text: string) =>
@@ -427,6 +440,15 @@ describe("NativeSubagentRuntime lifecycle", () => {
       });
       await runtime.finishTask("tester", "completed", async () => {}, send);
     }
+    // Every run is the named teammate.
+    const spawns = published.flatMap(({ update }) =>
+      update.sessionUpdate === "subagent_spawned" ? [[update.name, update._meta?.claudeCode]] : [],
+    );
+    expect(spawns).toEqual([
+      ["tester", { teammate: true }],
+      ["tester", { teammate: true }],
+      ["tester", { teammate: true }],
+    ]);
   });
 
   it("announces a resumed nested subagent under a live ancestor when its parent has finished", async () => {

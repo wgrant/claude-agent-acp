@@ -8,6 +8,8 @@ export type NativeSubagent = {
   /** The Agent call that spawned the first generation; a teammate's own
    *  updates keep naming it after a message wakes a later generation. */
   spawnToolUseId?: string;
+  /** A named teammate, which waits for messages between runs. */
+  teammate?: boolean;
   name: string;
   task: string;
   /**
@@ -203,12 +205,16 @@ export class NativeSubagentRuntime {
       {
         parentSessionId: knownParentSessionId ?? this.rootSessionId,
         parentToolUseId: task.toolUseId ?? undefined,
-        name: subagentDisplayName(
-          identity?.name,
-          identity?.description ?? task.description,
-          identity?.subagentType ?? task.subagentType,
-          task.taskId,
-        ),
+        teammate: wokenByMessage || previous?.teammate || Boolean(identity?.name),
+        // A message wake has no Agent call to name it; it is still the same teammate.
+        name: wokenByMessage
+          ? previous.name
+          : subagentDisplayName(
+              identity?.name,
+              identity?.description ?? task.description,
+              identity?.subagentType ?? task.subagentType,
+              task.taskId,
+            ),
         task: subagentDescription(
           identity?.prompt ?? task.prompt,
           identity?.description ?? task.description,
@@ -241,6 +247,8 @@ export class NativeSubagentRuntime {
       {
         parentSessionId: this.resumedParentSessionId(previous),
         parentToolUseId: previous.parentToolUseId,
+        // Only a message resumes a finished child, so it is a teammate.
+        teammate: true,
         name: previous.name,
         task: previous.task,
         ...promptField(promptText(prompt)),
@@ -449,7 +457,7 @@ export class NativeSubagentRuntime {
     previous: NativeSubagent | undefined,
     fields: Pick<
       NativeSubagent,
-      "parentSessionId" | "parentToolUseId" | "name" | "task" | "prompt"
+      "parentSessionId" | "parentToolUseId" | "name" | "task" | "prompt" | "teammate"
     >,
     announce: boolean,
     deliver: Publish,
@@ -505,6 +513,7 @@ export async function announceNativeSubagent(
         task: child.task,
         ...promptField(child.prompt),
         capabilities: {},
+        ...(child.teammate ? { _meta: { claudeCode: { teammate: true } } } : {}),
       },
     });
     child.announced = true;
@@ -753,6 +762,7 @@ function applySubagentIdentity(
   identity: SubagentIdentity | undefined,
 ): void {
   if (!identity) return;
+  if (identity.name) child.teammate = true;
   if (identity.name || identity.description) {
     child.name = subagentDisplayName(
       identity.name,
