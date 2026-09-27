@@ -27,6 +27,7 @@ export class ForkTranscript {
   private readonly timer: ReturnType<typeof setInterval>;
   private polling: Promise<void> | undefined;
   private finished = false;
+  private cancelled = false;
   private ended = false;
 
   constructor(
@@ -40,6 +41,7 @@ export class ForkTranscript {
     this.polling ??= (async () => {
       try {
         for (const message of await this.read()) {
+          if (this.cancelled) return;
           if (this.seen.has(message.uuid)) continue;
           this.seen.add(message.uuid);
           this.ended = isFinalReply(message);
@@ -54,21 +56,23 @@ export class ForkTranscript {
     return this.polling;
   }
 
-  /** Deliver the rest of the transcript, then stop. */
+  /** Deliver the rest of the transcript, then stop; a repeat call waits for a running poll. */
   async finish(): Promise<void> {
     clearInterval(this.timer);
-    if (this.finished) return;
+    if (this.finished) return this.polling;
     this.finished = true;
     await this.polling;
     for (let waited = 0; ; waited += SETTLE_MS) {
       await this.poll();
-      if (this.ended || waited >= SETTLE_LIMIT_MS) return;
+      if (this.ended || this.cancelled || waited >= SETTLE_LIMIT_MS) return;
       await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
     }
   }
 
+  /** Stop, delivering nothing more, even from a poll already running. */
   cancel(): void {
     clearInterval(this.timer);
     this.finished = true;
+    this.cancelled = true;
   }
 }
