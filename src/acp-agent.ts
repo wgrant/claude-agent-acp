@@ -233,6 +233,7 @@ import {
   sentenceCase,
   splitNoticeText,
 } from "./session-notices.js";
+import { aoeUpdate, clientWantsUpdate, OutputTokenMeter } from "./aoe-updates.js";
 import {
   applyTaskCreate,
   applyTaskList,
@@ -3944,6 +3945,14 @@ export class ClaudeAcpAgent {
      *  `tool_use_id` so hosts can collapse them; a notice has no lifecycle to
      *  update, so only the first becomes one. */
     const noticedToolUses = new Set<string>();
+    const outputTokens = clientWantsUpdate(this.clientCapabilities, "turn_output_tokens")
+      ? new OutputTokenMeter((tokens) =>
+          sendUpdate({
+            sessionId: params.sessionId,
+            update: aoeUpdate("turn_output_tokens", { tokens }),
+          }),
+        )
+      : undefined;
     const asyncTasks = (session.asyncTaskRuntime ??= new AsyncTaskRuntime(
       clientSupportsAsyncTasks(this.clientCapabilities),
       params.sessionId,
@@ -5518,6 +5527,21 @@ export class ClaudeAcpAgent {
               case "hook_started":
               case "hook_progress":
               case "hook_response":
+                if (clientWantsUpdate(this.clientCapabilities, "hook_update")) {
+                  await sendUpdate({
+                    sessionId: message.session_id,
+                    update: aoeUpdate("hook_update", {
+                      hookId: message.hook_id,
+                      name: message.hook_name,
+                      event: message.hook_event,
+                      status: message.subtype === "hook_response" ? message.outcome : "running",
+                      ...(message.subtype !== "hook_started" && { output: message.output }),
+                      ...(message.subtype === "hook_response" &&
+                        message.exit_code !== undefined && { exitCode: message.exit_code }),
+                    }),
+                  });
+                }
+                break;
               case "files_persisted":
                 break;
               case "task_progress":
@@ -5702,10 +5726,11 @@ export class ClaudeAcpAgent {
                 }
                 break;
               }
+              case "thinking_tokens":
+                await outputTokens?.thought(message.estimated_tokens_delta);
+                break;
               case "plugin_install":
               case "notification":
-              case "thinking_tokens":
-                // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               case "api_retry": {
                 const kind =
@@ -5883,6 +5908,7 @@ export class ClaudeAcpAgent {
             }
             break;
           case "result": {
+            outputTokens?.turnEnded();
             // The result ends the model turn. A background task that still
             // waits for its tool call id gets its spawn now, without the id.
             await asyncTasks.releaseHeld();
@@ -6581,6 +6607,11 @@ export class ClaudeAcpAgent {
             // the current entry; anything else opens a new one.
             if (message.event.type === "content_block_delta") {
               const delta = message.event.delta;
+              if (message.parent_tool_use_id === null) {
+                if (delta.type === "text_delta") await outputTokens?.streamed(delta.text);
+                if (delta.type === "input_json_delta")
+                  await outputTokens?.streamed(delta.partial_json);
+              }
               const chunk =
                 delta.type === "text_delta"
                   ? { type: "text" as const, text: delta.text }
@@ -6608,6 +6639,7 @@ export class ClaudeAcpAgent {
               (message.event.type === "message_start" || message.event.type === "message_delta")
             ) {
               if (message.event.type === "message_start") {
+                outputTokens?.messageStarted();
                 lastAssistantUsage = snapshotFromUsage(message.event.message.usage);
                 const model = message.event.message.model;
                 if (model && model !== "<synthetic>") {
@@ -6632,6 +6664,7 @@ export class ClaudeAcpAgent {
                 }
               } else {
                 const usage = message.event.usage;
+                await outputTokens?.billedOutput(usage.output_tokens);
                 const prev: Readonly<UsageSnapshot> = lastAssistantUsage ?? ZERO_USAGE;
                 // Per Anthropic API, message_delta usage fields are *cumulative*;
                 // nullable fields (input_tokens and the cache fields) fall back
@@ -7200,7 +7233,23 @@ export class ClaudeAcpAgent {
             break;
           }
           case "tool_use_summary":
+            if (clientWantsUpdate(this.clientCapabilities, "tool_use_summary")) {
+              await sendUpdate({
+                sessionId: message.session_id,
+                update: aoeUpdate("tool_use_summary", {
+                  summary: message.summary,
+                  toolCallIds: message.preceding_tool_use_ids,
+                }),
+              });
+            }
+            break;
           case "prompt_suggestion":
+            if (clientWantsUpdate(this.clientCapabilities, "prompt_suggestion")) {
+              await sendUpdate({
+                sessionId: message.session_id,
+                update: aoeUpdate("prompt_suggestion", { suggestion: message.suggestion }),
+              });
+            }
             break;
           case "auth_status":
             if (!message.isAuthenticating && message.error === undefined) {
@@ -9624,6 +9673,9 @@ export class ClaudeAcpAgent {
       ...providerEnv,
       // Opt-in to session state events like when the agent is idle
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
+      ...(clientWantsUpdate(this.clientCapabilities, "tool_use_summary") && {
+        CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES: "1",
+      }),
     };
     // Scopes the context-window cache to this query's backend (see
     // `contextWindowCache`). Derived from the same `env` object handed to the
@@ -9639,6 +9691,10 @@ export class ClaudeAcpAgent {
       settingSources: ["user", "project", "local"],
       ...(thinking !== undefined && { thinking }),
       ...userProvidedOptions,
+      ...(clientWantsUpdate(this.clientCapabilities, "hook_update") && { includeHookEvents: true }),
+      ...(clientWantsUpdate(this.clientCapabilities, "prompt_suggestion") && {
+        promptSuggestions: true,
+      }),
       // Claude Code uses the same checkpoint store for /rewind. Enable it only
       // for clients that negotiated per-turn file-change reports; this avoids
       // snapshot I/O for every other session.
