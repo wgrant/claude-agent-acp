@@ -5,6 +5,9 @@ export type NativeSubagent = {
   sessionId: string;
   parentSessionId: string;
   parentToolUseId?: string;
+  /** The Agent call that spawned the first generation; a teammate's own
+   *  updates keep naming it after a message wakes a later generation. */
+  spawnToolUseId?: string;
   name: string;
   task: string;
   /**
@@ -188,6 +191,10 @@ export class NativeSubagentRuntime {
       (task.toolUseId ? this.parentByToolUse.get(task.toolUseId) : undefined) ??
       (previous && this.resumedParentSessionId(previous));
     const identity = task.toolUseId ? this.identityByToolUse.get(task.toolUseId) : undefined;
+    // A message wake starts from the SendMessage call, which has no Agent
+    // control frame; a relaunch by a new Agent call does.
+    const wokenByMessage =
+      previous !== undefined && !(task.toolUseId && this.controlByToolUse.has(task.toolUseId));
     // A nested child must wait for the spawning Agent/Task frame to establish
     // its immediate parent. Root children without a tool id can be announced.
     await this.openGeneration(
@@ -210,6 +217,7 @@ export class NativeSubagentRuntime {
       },
       !!knownParentSessionId || !task.toolUseId,
       deliver,
+      wokenByMessage,
     );
   }
 
@@ -239,6 +247,7 @@ export class NativeSubagentRuntime {
       },
       true,
       deliver,
+      true,
     );
   }
 
@@ -431,7 +440,9 @@ export class NativeSubagentRuntime {
   /**
    * Registers a new child session for the task and makes it the owner of its
    * parent tool call. With `announce`, it publishes `subagent_spawned` and
-   * delivers the updates that waited for the child.
+   * delivers the updates that waited for the child. A generation woken by a
+   * message also owns the Agent call that spawned the first one, which a
+   * teammate's own updates keep naming.
    */
   private async openGeneration(
     taskId: string,
@@ -442,10 +453,15 @@ export class NativeSubagentRuntime {
     >,
     announce: boolean,
     deliver: Publish,
+    wokenByMessage = false,
   ): Promise<void> {
+    const spawnToolUseId = previous
+      ? (previous.spawnToolUseId ?? previous.parentToolUseId)
+      : fields.parentToolUseId;
     const child: NativeSubagent = {
       sessionId: this.nextChildSessionId(taskId, previous),
       ...fields,
+      spawnToolUseId,
     };
     const toolUseId = child.parentToolUseId;
     this.children.set(taskId, child);
@@ -453,6 +469,9 @@ export class NativeSubagentRuntime {
       this.taskByToolUse.set(toolUseId, taskId);
       this.childByParentToolUse.set(toolUseId, child);
       this.controlByToolUse.delete(toolUseId);
+    }
+    if (wokenByMessage && spawnToolUseId && spawnToolUseId !== toolUseId) {
+      this.childByParentToolUse.set(spawnToolUseId, child);
     }
     if (!announce) return;
     await announceNativeSubagent(child, this.publish);
