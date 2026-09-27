@@ -299,7 +299,12 @@ import {
   type ToolUpdateMeta,
 } from "./tool-calls/renderer.js";
 import { resolveSkillPath, type SkillScanCache } from "./tool-calls/reporters/interaction.js";
-import { startTerminalTail, stopTerminalTail, taskOutputPath } from "./terminal-tail.js";
+import {
+  startTerminalTail,
+  stopTerminalTail,
+  tailNextTaskOutput,
+  taskOutputPath,
+} from "./terminal-tail.js";
 import {
   messageLoopYielder,
   nodeToWebReadable,
@@ -7726,6 +7731,30 @@ export class ClaudeAcpAgent {
               for (const block of Array.isArray(content) ? content : []) {
                 if (isToolUseBlock(block)) {
                   recordReachedToolUse(session, block.id, stoppedWorkOutput);
+                }
+              }
+            }
+            if (message.type === "assistant" && this.toolCallCapabilities.terminalOutputDelta) {
+              const parentToolUseId = message.parent_tool_use_id;
+              for (const block of message.message.content) {
+                if (
+                  block.type === "tool_use" &&
+                  (block.name === "Bash" || block.name === "PowerShell")
+                ) {
+                  const toolCallId = block.id;
+                  tailNextTaskOutput(toolCallId, message.session_id, (data) =>
+                    sendUpdate({
+                      sessionId: message.session_id,
+                      update: {
+                        sessionUpdate: "tool_call_update",
+                        toolCallId,
+                        _meta: {
+                          terminal_output_delta: { terminal_id: toolCallId, data },
+                          ...(parentToolUseId ? { claudeCode: { parentToolUseId } } : {}),
+                        },
+                      },
+                    }),
+                  );
                 }
               }
             }
