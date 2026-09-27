@@ -3,8 +3,8 @@
 // `<tmp>/claude-<uid>/<project>/<session>/tasks/<task_id>.output`, deleting it
 // when the command ends. Tailing that file lets the client show output live,
 // as codex-acp does with `terminal_output_delta`. `tool_progress` names the
-// task only in remote environments, so a call is otherwise matched to the
-// next new task file in its session.
+// task only in remote environments; otherwise a new task file is matched to a
+// call only when that is unambiguous (see `discover`).
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -81,10 +81,7 @@ export function startTerminalTail(
   if (tails.has(toolCallId)) {
     return;
   }
-  const waiting = pending.findIndex((call) => call.toolCallId === toolCallId);
-  if (waiting >= 0) {
-    pending.splice(waiting, 1);
-  }
+  forget(toolCallId);
   claimed.add(file);
   let offset = 0;
   const decoder = new StringDecoder("utf8");
@@ -142,15 +139,19 @@ const DISCOVERY_TIMEOUT_MS = 10 * 60 * 1000;
 
 interface PendingCall {
   toolCallId: string;
-  sessionId: string;
-  send: (data: string) => Promise<void>;
+  /** Absent for a call that may start a shell but is not tailed. */
+  send?: (data: string) => Promise<void>;
   since: number;
-  /** Task files that existed before the call started. */
+}
+
+interface SessionCalls {
+  /** Shell calls waiting for their task file. */
+  pending: PendingCall[];
+  /** Task files never to attribute: older than a waiting call, or ambiguous. */
   known: Set<string>;
 }
 
-/** Shell calls waiting for their task file, oldest first. */
-const pending: PendingCall[] = [];
+const sessions = new Map<string, SessionCalls>();
 const claimed = new Set<string>();
 let discovery: ReturnType<typeof setInterval> | undefined;
 
@@ -167,69 +168,89 @@ function listShellTaskFiles(sessionId: string): string[] {
   });
 }
 
-function birth(file: string): number {
-  try {
-    const stat = fs.statSync(file);
-    return stat.birthtimeMs || stat.ctimeMs;
-  } catch {
-    return Infinity;
+/** Stop matching `toolCallId`. A file not yet matched may be its own, so no other call gets one. */
+function forget(toolCallId: string): void {
+  for (const [sessionId, calls] of sessions) {
+    const index = calls.pending.findIndex((call) => call.toolCallId === toolCallId);
+    if (index < 0) continue;
+    calls.pending.splice(index, 1);
+    if (calls.pending.length === 0) {
+      sessions.delete(sessionId);
+    } else {
+      for (const file of listShellTaskFiles(sessionId)) calls.known.add(file);
+    }
+    return;
   }
 }
 
-/** Match new task files to waiting calls, both in the order they started. */
+/**
+ * Match a new task file to the call that created it. Task files do not name
+ * their command, so a file is attributed only when exactly one call in its
+ * session is waiting and exactly one new file appeared; anything else is
+ * ambiguous and those files are never tailed.
+ */
 function discover(): void {
   const now = Date.now();
-  for (let i = pending.length - 1; i >= 0; i--) {
-    if (now - pending[i].since > DISCOVERY_TIMEOUT_MS) {
-      pending.splice(i, 1);
+  for (const [sessionId, calls] of sessions) {
+    for (const call of calls.pending.filter((call) => now - call.since > DISCOVERY_TIMEOUT_MS)) {
+      forget(call.toolCallId);
     }
-  }
-  for (const sessionId of new Set(pending.map((call) => call.sessionId))) {
-    const calls = pending.filter((call) => call.sessionId === sessionId);
-    const files = listShellTaskFiles(sessionId)
-      .filter((file) => !claimed.has(file) && !calls[0].known.has(file))
-      .sort((a, b) => birth(a) - birth(b));
-    for (const [call, file] of calls.map((call, i) => [call, files[i]] as const)) {
-      if (!file || call.known.has(file)) {
-        break;
+    if (!sessions.has(sessionId)) continue;
+    const files = listShellTaskFiles(sessionId);
+    const fresh = files.filter((file) => !calls.known.has(file) && !claimed.has(file));
+    calls.known = new Set(files.filter((file) => calls.known.has(file)));
+    if (fresh.length === 0) continue;
+    const [call] = calls.pending;
+    if (calls.pending.length === 1 && fresh.length === 1) {
+      if (call.send) {
+        startTerminalTail(call.toolCallId, fresh[0], call.send);
+      } else {
+        forget(call.toolCallId);
       }
-      startTerminalTail(call.toolCallId, file, call.send);
     }
+    for (const file of fresh) calls.known.add(file);
   }
-  if (pending.length === 0 && discovery) {
+  if (sessions.size === 0 && discovery) {
     clearInterval(discovery);
     discovery = undefined;
   }
 }
 
-/** Tail the task file Claude Code creates for shell call `toolCallId`. */
+/**
+ * Tail the task file Claude Code creates for shell call `toolCallId`. Without
+ * `send`, the call only marks that a shell may start, so it is not mistaken
+ * for another call's.
+ */
 export function tailNextTaskOutput(
   toolCallId: string,
   sessionId: string,
-  send: (data: string) => Promise<void>,
+  send?: (data: string) => Promise<void>,
 ): void {
-  if (tails.has(toolCallId) || pending.some((call) => call.toolCallId === toolCallId)) {
+  if (
+    tails.has(toolCallId) ||
+    [...sessions.values()].some((calls) =>
+      calls.pending.some((call) => call.toolCallId === toolCallId),
+    )
+  ) {
     return;
   }
-  pending.push({
-    toolCallId,
-    sessionId,
-    send,
-    since: Date.now(),
-    known: new Set(listShellTaskFiles(sessionId)),
-  });
+  let calls = sessions.get(sessionId);
+  if (!calls) {
+    calls = { pending: [], known: new Set() };
+    sessions.set(sessionId, calls);
+  }
+  for (const file of listShellTaskFiles(sessionId)) calls.known.add(file);
+  calls.pending.push({ toolCallId, send, since: Date.now() });
   discovery ??= setInterval(discover, POLL_MS);
 }
 
 function halt(toolCallId: string): void {
-  const waiting = pending.findIndex((call) => call.toolCallId === toolCallId);
-  if (waiting >= 0) {
-    pending.splice(waiting, 1);
-  }
+  forget(toolCallId);
   const tail = tails.get(toolCallId);
   if (tail) {
     clearInterval(tail.timer);
     claimed.delete(tail.file);
+    for (const calls of sessions.values()) calls.known.add(tail.file);
     tails.delete(toolCallId);
   }
 }
@@ -238,4 +259,15 @@ function halt(toolCallId: string): void {
 export function stopTerminalTail(toolCallId: string): boolean {
   halt(toolCallId);
   return streamed.delete(toolCallId);
+}
+
+/** Stop every tail and pending match in `sessionId`, whose calls will get no result. */
+export function stopSessionTails(sessionId: string): void {
+  for (const call of [...(sessions.get(sessionId)?.pending ?? [])]) forget(call.toolCallId);
+  for (const [toolCallId, tail] of tails) {
+    if (path.basename(path.dirname(path.dirname(tail.file))) === sessionId) {
+      halt(toolCallId);
+      streamed.delete(toolCallId);
+    }
+  }
 }
