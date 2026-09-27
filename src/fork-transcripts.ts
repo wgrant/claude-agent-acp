@@ -56,15 +56,18 @@ export class ForkTranscript {
     return this.polling;
   }
 
-  /** Deliver the rest of the transcript, then stop; a repeat call waits for a running poll. */
-  async finish(): Promise<void> {
+  /**
+   * Deliver the rest of the transcript, then stop; a repeat call waits for a
+   * running poll. Only a completed fork has a final reply worth waiting for.
+   */
+  async finish(completed: boolean): Promise<void> {
     clearInterval(this.timer);
     if (this.finished) return this.polling;
     this.finished = true;
     await this.polling;
     for (let waited = 0; ; waited += SETTLE_MS) {
       await this.poll();
-      if (this.ended || this.cancelled || waited >= SETTLE_LIMIT_MS) return;
+      if (!completed || this.ended || this.cancelled || waited >= SETTLE_LIMIT_MS) return;
       await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
     }
   }
