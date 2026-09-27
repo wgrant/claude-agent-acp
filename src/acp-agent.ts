@@ -260,6 +260,7 @@ import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer, type ToolUpdateMeta } from "./tool-calls/renderer.js";
 import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
+import { startTerminalTail, stopTerminalTail, taskOutputPath } from "./terminal-tail.js";
 import {
   nodeToWebReadable,
   nodeToWebWritable,
@@ -7040,6 +7041,31 @@ export class ClaudeAcpAgent {
             if (toolCallFieldsOf(session).apply(beat)) {
               await sendUpdate({ sessionId: params.sessionId, update: beat });
             }
+            if (
+              (message.tool_name === "Bash" || message.tool_name === "PowerShell") &&
+              message.task_id &&
+              toolCallId === message.tool_use_id &&
+              this.toolCallCapabilities.terminalOutputDelta
+            ) {
+              const file = taskOutputPath(message.session_id, message.task_id);
+              if (file) {
+                startTerminalTail(toolCallId, file, (data) =>
+                  sendUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "tool_call_update",
+                      toolCallId,
+                      _meta: {
+                        terminal_output_delta: { terminal_id: toolCallId, data },
+                        ...(subagentParentToolUseId
+                          ? { claudeCode: { parentToolUseId: subagentParentToolUseId } }
+                          : {}),
+                      },
+                    },
+                  }),
+                );
+              }
+            }
             break;
           }
           case "rate_limit_event": {
@@ -11334,6 +11360,9 @@ export function toAcpNotifications(
           if (entries) update = { sessionUpdate: "plan", entries };
         } else if (toolUse.name !== "TodoWrite") {
           // A command sends its output first, then the exit and the status.
+          // A tailed call already streamed its output, so the result replaces
+          // it as a `terminal_output` snapshot rather than appending a delta.
+          const tailed = stopTerminalTail(chunk.tool_use_id);
           const [finalUpdate, ...rest] = renderer
             .result(toolUse, chunk as Parameters<AcpToolCallRenderer["result"]>[1], {
               structured: toolUseResult,
@@ -11341,6 +11370,10 @@ export function toAcpNotifications(
             })
             .reverse();
           for (const outputUpdate of rest.reverse()) {
+            const delta = outputUpdate._meta?.terminal_output_delta;
+            if (tailed && delta) {
+              outputUpdate._meta = { terminal_output: delta };
+            }
             if (options?.parentToolUseId) {
               stampParentToolUseId(outputUpdate, options.parentToolUseId);
             }
