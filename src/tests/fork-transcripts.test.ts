@@ -28,7 +28,7 @@ describe("ForkTranscript", () => {
     expect(delivered).toEqual(["a", "b"]);
     // The final reply lands on disk only after the fork has ended.
     transcript = [msg("a"), msg("b"), msg("c")];
-    const finished = fork.finish();
+    const finished = fork.finish(true);
     await vi.advanceTimersByTimeAsync(250);
     transcript = [msg("a"), msg("b"), msg("c"), msg("d", true)];
     await vi.advanceTimersByTimeAsync(250);
@@ -59,8 +59,23 @@ describe("ForkTranscript", () => {
     await started;
     fork.cancel();
     release([msg("a"), msg("b", true)]);
-    await fork.finish();
+    await fork.finish(true);
     expect(delivered).toEqual([]);
+    vi.useRealTimers();
+  });
+
+  it("does not wait for a final reply from a fork that did not complete", async () => {
+    vi.useFakeTimers();
+    const delivered: string[] = [];
+    const fork = new ForkTranscript(
+      async () => [msg("a")],
+      async (m) => {
+        delivered.push(m.uuid);
+      },
+    );
+    // Resolves without advancing the settle timer.
+    await fork.finish(false);
+    expect(delivered).toEqual(["a"]);
     vi.useRealTimers();
   });
 });

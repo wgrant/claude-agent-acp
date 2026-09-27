@@ -4625,10 +4625,13 @@ export class ClaudeAcpAgent {
     const routedNotificationClient = { sessionUpdate: sendUpdate } as unknown as AcpClient;
     session.nativeSubagentDeliver = sendUpdate;
     const forkTranscripts = new Map<string, ForkTranscript>();
-    const finishForkTranscript = async (taskId: string) => {
+    // Awaited in the message loop so the fork's final reply precedes its
+    // child's finish and the Skill result that ends the parent's wait for it.
+    // The wait is bounded and usually one read.
+    const finishForkTranscript = async (taskId: string, status: string) => {
       const transcript = forkTranscripts.get(taskId);
       forkTranscripts.delete(taskId);
-      await transcript?.finish();
+      await transcript?.finish(status === "completed");
     };
 
     const finishLifecycle = async (
@@ -6565,7 +6568,7 @@ export class ClaudeAcpAgent {
                 if (subagents.isStaleEnd(message.task_id, message.tool_use_id)) break;
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
-                await finishForkTranscript(message.task_id);
+                await finishForkTranscript(message.task_id, message.status);
                 await subagents.finishTask(
                   message.task_id,
                   message.status,
@@ -6617,7 +6620,7 @@ export class ClaudeAcpAgent {
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
-                  await finishForkTranscript(message.task_id);
+                  await finishForkTranscript(message.task_id, message.patch.status);
                   await subagents.finishTask(
                     message.task_id,
                     message.patch.status,
