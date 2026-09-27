@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   startTerminalTail,
+  stopSessionTails,
   stopTerminalTail,
   tailNextTaskOutput,
   taskOutputPath,
@@ -13,6 +14,7 @@ import {
 describe("terminal tail", () => {
   const dirs: string[] = [];
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllEnvs();
     for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -71,5 +73,40 @@ describe("terminal tail", () => {
     fs.writeFileSync(path.join(tasks, "bnew.output"), "tick 1\n");
     await vi.waitFor(() => expect(sent.join("")).toBe("tick 1\n"));
     expect(stopTerminalTail("tool-2")).toBe(true);
+  });
+
+  it("tails a new task file only when a single waiting call can own it", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "tail-"));
+    dirs.push(base);
+    vi.stubEnv("CLAUDE_CODE_TMPDIR", base);
+    const uid = process.getuid?.();
+    const tasks = path.join(
+      base,
+      uid === undefined ? "claude" : `claude-${uid}`,
+      "-proj",
+      "sess-3",
+      "tasks",
+    );
+    fs.mkdirSync(tasks, { recursive: true });
+    const sent: Record<string, string> = { waiting: "", background: "" };
+    const sender = (id: string) => async (data: string) => {
+      sent[id] += data;
+    };
+
+    // One call waits for approval while another starts a background command.
+    tailNextTaskOutput("waiting", "sess-3", sender("waiting"));
+    tailNextTaskOutput("background", "sess-3", sender("background"));
+    fs.writeFileSync(path.join(tasks, "bbg.output"), "background output\n");
+    vi.advanceTimersByTime(300);
+    // Its result arrives at once, but its file lives on.
+    expect(stopTerminalTail("background")).toBe(false);
+    fs.writeFileSync(path.join(tasks, "bwait.output"), "approved output\n");
+    await vi.waitFor(() => expect(sent.waiting).toBe("approved output\n"));
+    expect(sent.background).toBe("");
+
+    // A closed session stops its tails, whose calls will get no result.
+    stopSessionTails("sess-3");
+    expect(stopTerminalTail("waiting")).toBe(false);
   });
 });

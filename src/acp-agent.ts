@@ -302,6 +302,7 @@ import { resolveSkillPath, type SkillScanCache } from "./tool-calls/reporters/in
 import { ForkTranscript } from "./fork-transcripts.js";
 import {
   startTerminalTail,
+  stopSessionTails,
   stopTerminalTail,
   tailNextTaskOutput,
   taskOutputPath,
@@ -4637,6 +4638,7 @@ export class ClaudeAcpAgent {
     ): Promise<void> => {
       for (const transcript of forkTranscripts.values()) transcript.cancel();
       forkTranscripts.clear();
+      stopSessionTails(params.sessionId);
       await compaction.interrupt();
       await Promise.all([
         subagents
@@ -7797,6 +7799,9 @@ export class ClaudeAcpAgent {
             if (message.type === "assistant" && this.toolCallCapabilities.terminalOutputDelta) {
               const parentToolUseId = message.parent_tool_use_id;
               for (const block of message.message.content) {
+                if (block.type === "tool_use" && block.name === "Monitor") {
+                  tailNextTaskOutput(block.id, message.session_id);
+                }
                 if (
                   block.type === "tool_use" &&
                   (block.name === "Bash" || block.name === "PowerShell")
@@ -13383,6 +13388,7 @@ export function toAcpNotifications(
               },
             });
           }
+          stopTerminalTail(chunk.tool_use_id);
           logger.error(
             `[claude-agent-acp] Got a tool result for tool use that wasn't tracked: ${chunk.tool_use_id}`,
           );
