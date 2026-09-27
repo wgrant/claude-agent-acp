@@ -390,6 +390,45 @@ describe("NativeSubagentRuntime lifecycle", () => {
     expect(terminalIds).toEqual(["worker-1", "worker-1:generation:2"]);
   });
 
+  it("routes a teammate woken by SendMessage to its new generation", async () => {
+    const runtime = new NativeSubagentRuntime(true, "root", {}, async () => {}, { log: () => {} });
+    const launch = (toolCallId: string) =>
+      ({
+        ...control("tool_call", "pending"),
+        update: { ...control("tool_call", "pending").update, toolCallId },
+      }) as AcpSessionNotification;
+    // The teammate's own output keeps naming the Agent call that spawned it.
+    const output = (text: string) =>
+      ({
+        sessionId: "root",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text },
+          _meta: { claudeCode: { parentToolUseId: "spawn-1" } },
+        },
+      }) as AcpSessionNotification;
+    const wake = (toolUseId: string) =>
+      runtime.taskStarted(
+        { taskId: "tester", toolUseId, subagentType: "general-purpose", description: "Wait" },
+        async () => {},
+      );
+
+    await runtime.route(launch("spawn-1"), async () => {});
+    await wake("spawn-1");
+    await runtime.finishTask("tester", "completed", async () => {}, "spawn-1");
+
+    for (const [send, generation] of [
+      ["send-1", "tester:generation:2"],
+      ["send-2", "tester:generation:3"],
+    ]) {
+      await wake(send);
+      await expect(runtime.route(output("working"), async () => {})).resolves.toMatchObject({
+        sessionId: generation,
+      });
+      await runtime.finishTask("tester", "completed", async () => {}, send);
+    }
+  });
+
   it("announces a resumed nested subagent under a live ancestor when its parent has finished", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
