@@ -260,6 +260,7 @@ import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer, type ToolUpdateMeta } from "./tool-calls/renderer.js";
 import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
+import { ForkTranscript } from "./fork-transcripts.js";
 import {
   startTerminalTail,
   stopTerminalTail,
@@ -4042,12 +4043,20 @@ export class ClaudeAcpAgent {
     // routing path as the immediate notifications.
     const routedNotificationClient = { sessionUpdate: sendUpdate } as unknown as AcpClient;
     session.nativeSubagentDeliver = sendUpdate;
+    const forkTranscripts = new Map<string, ForkTranscript>();
+    const finishForkTranscript = async (taskId: string) => {
+      const transcript = forkTranscripts.get(taskId);
+      forkTranscripts.delete(taskId);
+      await transcript?.finish();
+    };
 
     const finishLifecycle = async (
       nativeState: "completed" | "failed" | "cancelled",
       asyncState: "failed" | "stopped",
       context: string,
     ): Promise<void> => {
+      for (const transcript of forkTranscripts.values()) transcript.cancel();
+      forkTranscripts.clear();
       await compaction.interrupt();
       await Promise.all([
         subagents
@@ -5546,6 +5555,55 @@ export class ClaudeAcpAgent {
                   },
                   sendUpdate,
                 );
+                // A forked skill's transcript is withheld from the stream, so
+                // read it from the SDK while the fork runs.
+                if (
+                  message.skip_transcript === true &&
+                  !message.tool_use_id &&
+                  message.subagent_type &&
+                  !forkTranscripts.has(message.task_id)
+                ) {
+                  const parentToolUseId = subagents.adoptOrphan(message.task_id);
+                  if (parentToolUseId) {
+                    const sdkSessionId = message.session_id;
+                    const taskId = message.task_id;
+                    forkTranscripts.set(
+                      taskId,
+                      new ForkTranscript(
+                        () => getSubagentMessages(sdkSessionId, taskId),
+                        async (forkMessage) => {
+                          const content = (forkMessage.message as { content?: unknown })?.content;
+                          if (!Array.isArray(content)) return;
+                          // The fork's opening prompt is the task its session already shows.
+                          if (
+                            forkMessage.type === "user" &&
+                            !content.some((block) => block?.type === "tool_result")
+                          ) {
+                            return;
+                          }
+                          for (const notification of toAcpNotifications(
+                            content,
+                            forkMessage.type === "user" ? "user" : "assistant",
+                            params.sessionId,
+                            session.toolUseCache,
+                            routedNotificationClient,
+                            this.logger,
+                            {
+                              clientCapabilities: this.clientCapabilities,
+                              parentToolUseId,
+                              cwd: session.cwd,
+                              emittedToolCalls: session.emittedToolCalls,
+                              registerHooks: false,
+                              messageId: forkMessage.uuid,
+                            },
+                          )) {
+                            await sendUpdate(notification);
+                          }
+                        },
+                      ),
+                    );
+                  }
+                }
                 await asyncTasks.taskStarted({
                   task_id: message.task_id,
                   task_type: message.task_type,
@@ -5560,6 +5618,7 @@ export class ClaudeAcpAgent {
               case "task_notification":
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
+                await finishForkTranscript(message.task_id);
                 await subagents.finishTask(
                   message.task_id,
                   message.status,
@@ -5592,6 +5651,7 @@ export class ClaudeAcpAgent {
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
+                  await finishForkTranscript(message.task_id);
                   await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);
                   const parentToolUseId = session.liveBackgroundTasks.get(
                     message.task_id,
