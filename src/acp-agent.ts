@@ -234,7 +234,12 @@ import {
   sentenceCase,
   splitNoticeText,
 } from "./session-notices.js";
-import { aoeUpdate, clientWantsUpdate, OutputTokenMeter } from "./aoe-updates.js";
+import {
+  aoeUpdate,
+  clientRendersFindings,
+  clientWantsUpdate,
+  OutputTokenMeter,
+} from "./aoe-updates.js";
 import {
   applyTaskCreate,
   applyTaskList,
@@ -9766,6 +9771,7 @@ export class ClaudeAcpAgent {
       ...(clientWantsUpdate(this.clientCapabilities, "tool_use_summary") && {
         CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES: "1",
       }),
+      ...(clientRendersFindings(this.clientCapabilities) && { CLAUDE_CODE_REPORT_FINDINGS: "1" }),
     };
     // Scopes the context-window cache to this query's backend (see
     // `contextWindowCache`). Derived from the same `env` object handed to the
