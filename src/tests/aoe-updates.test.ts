@@ -33,9 +33,15 @@ describe("aoe session updates", () => {
     meter.messageStarted();
     tick();
     await meter.streamed("x".repeat(8));
+    // Held back by the throttle when the turn ends, 62 is never sent.
     meter.turnEnded();
     tick();
     await meter.streamed("x".repeat(4));
-    expect(sent).toEqual([30, 40, 55, 60, 62, 1]);
+    expect(sent).toEqual([30, 40, 50, 55, 60, 1]);
+    // A count held back by the throttle still goes out once the window passes.
+    await meter.streamed("x".repeat(40));
+    expect(sent.at(-1)).toBe(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(sent.at(-1)).toBe(11);
   });
 });

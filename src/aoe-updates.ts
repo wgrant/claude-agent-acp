@@ -37,6 +37,8 @@ export class OutputTokenMeter {
   private thinking = 0;
   private sent = 0;
   private sentAt = 0;
+  /** Sends the count a throttled update held back, so it never goes stale. */
+  private trailing: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly send: (tokens: number) => Promise<void>) {}
 
@@ -70,6 +72,8 @@ export class OutputTokenMeter {
     this.thinking = 0;
     this.sent = 0;
     this.sentAt = 0;
+    clearTimeout(this.trailing);
+    this.trailing = undefined;
   }
 
   private current(): number {
@@ -78,10 +82,17 @@ export class OutputTokenMeter {
 
   private async report(): Promise<void> {
     const tokens = this.earlier + this.current();
-    const now = Date.now();
-    if (tokens === this.sent || now - this.sentAt < TOKEN_UPDATE_MS) return;
+    if (tokens === this.sent) return;
+    const wait = this.sentAt + TOKEN_UPDATE_MS - Date.now();
+    if (wait > 0) {
+      this.trailing ??= setTimeout(() => {
+        this.trailing = undefined;
+        void this.report().catch(() => {});
+      }, wait);
+      return;
+    }
     this.sent = tokens;
-    this.sentAt = now;
+    this.sentAt = Date.now();
     await this.send(tokens);
   }
 }
