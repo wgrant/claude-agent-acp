@@ -2883,6 +2883,105 @@ describe("session/list", () => {
   });
 });
 
+describe("rate limit reporting", () => {
+  const rateLimitInfo = {
+    status: "allowed_warning" as const,
+    rateLimitType: "five_hour" as const,
+    utilization: 42,
+  };
+
+  function rateLimitEvent() {
+    return {
+      type: "rate_limit_event" as const,
+      rate_limit_info: rateLimitInfo,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  function assistantMessage() {
+    return {
+      type: "assistant" as const,
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        id: "msg-1",
+        type: "message",
+        role: "assistant",
+        container: null,
+        model: "claude-sonnet-4-20250514",
+        content: [{ type: "text", text: "hi", citations: null }],
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      },
+    };
+  }
+
+  // The CLI emits rate_limit_event at session start, ahead of the first
+  // assistant usage of a fresh process's first turn. Regression test for
+  // agentclientprotocol/claude-agent-acp#1127: that early event must not be
+  // dropped just because no usage has been recorded for the turn yet.
+  it("attaches a rate_limit_event seen before any usage to the turn's usage_update", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const user = await input[Symbol.asyncIterator]().next();
+        yield userEcho(user.value);
+        yield rateLimitEvent();
+        yield assistantMessage();
+        yield successfulResultMessage();
+      }
+      return messages();
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    const usageUpdates = updates.filter((u) => u.update.sessionUpdate === "usage_update");
+    expect(usageUpdates).toHaveLength(1);
+    expect((usageUpdates[0]!.update._meta as any)?.["_claude/rateLimit"]).toEqual(rateLimitInfo);
+  });
+
+  it("still reports a rate_limit_event that arrives after usage is already known", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const user = await input[Symbol.asyncIterator]().next();
+        yield userEcho(user.value);
+        yield assistantMessage();
+        yield rateLimitEvent();
+        yield successfulResultMessage();
+      }
+      return messages();
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    const usageUpdates = updates.filter((u) => u.update.sessionUpdate === "usage_update");
+    expect(
+      usageUpdates.some((u) => (u.update._meta as any)?.["_claude/rateLimit"]?.utilization === 42),
+    ).toBe(true);
+  });
+});
+
 describe("subagent transcript replay", () => {
   const replayHistory = [
     {
