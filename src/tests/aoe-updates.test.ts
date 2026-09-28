@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { clientWantsUpdate, OutputTokenMeter } from "../aoe-updates.js";
+import { clientRendersFindings, clientWantsUpdate, OutputTokenMeter } from "../aoe-updates.js";
 
 describe("aoe session updates", () => {
   afterEach(() => vi.useRealTimers());
@@ -9,6 +9,8 @@ describe("aoe session updates", () => {
     expect(clientWantsUpdate(caps, "hook_update")).toBe(true);
     expect(clientWantsUpdate(caps, "prompt_suggestion")).toBe(false);
     expect(clientWantsUpdate({}, "hook_update")).toBe(false);
+    expect(clientRendersFindings({ _meta: { "aoe/reportFindings": true } })).toBe(true);
+    expect(clientRendersFindings(caps)).toBe(false);
   });
 
   it("meter a turn's output from estimates until each message is billed", async () => {
