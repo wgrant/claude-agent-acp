@@ -82,6 +82,7 @@ import {
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
+  SDKRateLimitInfo,
   SessionMessage,
   SDKUserMessage,
   Settings,
@@ -3860,6 +3861,12 @@ export class ClaudeAcpAgent {
     // currently being processed, which is sequential — exactly one turn is
     // active at a time. Mirrors the locals the old per-prompt loop held.
     let lastAssistantTotalUsage: number | null = null;
+    // A `rate_limit_event` that lands before this turn's first usage has
+    // nowhere to attach: hold it and merge it into the next usage_update
+    // instead of dropping it (the CLI only re-emits on a state change, so a
+    // dropped event can leave the client without limit info for a long
+    // stretch). See agentclientprotocol/claude-agent-acp#1127.
+    let pendingRateLimitInfo: SDKRateLimitInfo | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
     // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
@@ -4037,6 +4044,16 @@ export class ClaudeAcpAgent {
           session.emittedAssistantText = true;
           session.titles.onAssistantText(update.content);
         }
+      }
+      if (
+        pendingRateLimitInfo !== null &&
+        routedNotification.update.sessionUpdate === "usage_update"
+      ) {
+        routedNotification.update._meta = {
+          ...routedNotification.update._meta,
+          "_claude/rateLimit": pendingRateLimitInfo,
+        };
+        pendingRateLimitInfo = null;
       }
       await this.client.sessionUpdate(routedNotification);
       if (
@@ -7209,6 +7226,11 @@ export class ClaudeAcpAgent {
                   _meta: { "_claude/rateLimit": message.rate_limit_info },
                 }),
               });
+            } else {
+              // No usage yet this turn (the CLI emits this at session start,
+              // ahead of the first assistant message): keep it for sendUpdate
+              // to merge into the next usage_update rather than losing it.
+              pendingRateLimitInfo = message.rate_limit_info;
             }
             break;
           }
