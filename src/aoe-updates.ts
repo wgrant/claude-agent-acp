@@ -15,6 +15,13 @@ export function clientWantsUpdate(
   return Array.isArray(kinds) && kinds.includes(kind);
 }
 
+/** A client that renders Claude Code's ReportFindings, so code reviews report through it. */
+export function clientRendersFindings(
+  capabilities: ClientCapabilities | null | undefined,
+): boolean {
+  return capabilities?._meta?.["aoe/reportFindings"] === true;
+}
+
 export function aoeUpdate(
   kind: AoeUpdateKind,
   fields: Record<string, unknown>,
