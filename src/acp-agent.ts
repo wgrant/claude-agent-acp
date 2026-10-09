@@ -1,3 +1,4 @@
+import { IdleCompaction as AoeIdleCompaction } from "./aoe-idle-compaction.js";
 import {
   agent as acpAgent,
   AgentApp,
@@ -1057,6 +1058,7 @@ type OpenUserInput = {
 };
 
 export type Session = {
+  aoeIdleCompaction?: AoeIdleCompaction;
   query: Query;
   input: Pushable<SDKUserMessage>;
   /** Set by a cancel. While it is set, the consumer treats what arrives as the
@@ -4038,12 +4040,24 @@ export class ClaudeAcpAgent {
     }
 
     const userMessage = promptToClaude(params);
+    if (
+      params._meta?.idleCompaction === true &&
+      (session.activeTurn ||
+        session.turnQueue?.some((turn) => !turn.settled) ||
+        session.liveBackgroundTasks.size > 0)
+    ) {
+      throw new Error("Session became busy before idle compaction");
+    }
+    session.aoeIdleCompaction?.disarm();
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
 
     // Local-only commands (e.g. `/clear`) return a result without replaying the
     // user message, so the consumer can't promote the turn from the echo.
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    if (["/compact", "/clear"].includes(firstText.split(" ", 1)[0])) {
+      session.aoeIdleCompaction?.invalidate();
+    }
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
@@ -7245,6 +7259,11 @@ export class ClaudeAcpAgent {
             // The CLI predicts the next prompt right after this result, so a
             // `prompt_suggestion` from here on belongs to the turn just ended.
             session.promptSuggestionExpected = true;
+            if (message.subtype === "success") {
+              queueMicrotask(() => session.aoeIdleCompaction?.arm());
+            } else {
+              session.aoeIdleCompaction?.invalidate();
+            }
             outputTokens?.turnEnded();
             // The result ends the model turn. A background task that still
             // waits for its tool call id gets its spawn now, without the id.
@@ -8047,6 +8066,7 @@ export class ClaudeAcpAgent {
               (message.event.type === "message_start" || message.event.type === "message_delta")
             ) {
               if (message.event.type === "message_start") {
+                session.aoeIdleCompaction?.observe(message.event.message.usage, message.ttft_ms);
                 outputTokens?.messageStarted();
                 lastAssistantUsage = snapshotFromUsage(message.event.message.usage);
                 const model = message.event.message.model;
@@ -9160,6 +9180,7 @@ export class ClaudeAcpAgent {
       session.cancelledPrompts.add(turn.promptUuid);
       for (const uuid of turn.steeredUuids ?? []) session.cancelledPrompts.add(uuid);
     }
+    session.aoeIdleCompaction?.invalidate();
     for (const turn of session.turnQueue ?? []) turn.localCommandAbort?.abort();
     session.pendingExitPlanModeInterruption = undefined;
     session.pendingExitPlanContextReset = undefined;
@@ -9541,6 +9562,7 @@ export class ClaudeAcpAgent {
       }
       this.backgroundWork.sync(sessionId, session, this.foregroundState(sessionId));
     }
+    session.aoeIdleCompaction?.invalidate();
     session.consumer = undefined;
     session.contextCompaction = undefined;
     session.idleCompaction?.dispose();
@@ -11649,6 +11671,7 @@ export class ClaudeAcpAgent {
     configId: string,
     value: string,
   ): Promise<void> {
+    session.aoeIdleCompaction?.invalidate();
     if (configId === MODE_CONFIG_ID) {
       this.sessionModes.syncConfig(session, value);
     } else if (configId === MODEL_CONFIG_ID) {
@@ -12572,6 +12595,7 @@ export class ClaudeAcpAgent {
             hooks: [
               async (input) => {
                 if (input.hook_event_name === "PostCompact" && !input.agent_id) {
+                  this.sessions[sessionId]?.aoeIdleCompaction?.invalidate();
                   this.sessions[sessionId]?.contextCompaction?.recordSummary(input.compact_summary);
                 }
                 return { continue: true };
@@ -12970,6 +12994,36 @@ export class ClaudeAcpAgent {
         // The CLI's own environment: process env, the client's and the provider's.
         { env },
       );
+      const idleMinimum = Number(process.env.AOE_CLAUDE_IDLE_COMPACT_MIN_TOKENS);
+      if (Number.isSafeInteger(idleMinimum) && idleMinimum >= 100_000 && idleMinimum <= 1_000_000) {
+        const owner = this.sessions[sessionId];
+        owner.aoeIdleCompaction = new AoeIdleCompaction(
+          idleMinimum,
+          async () => {
+            if (
+              this.sessions[sessionId] !== owner ||
+              owner.queryClosed ||
+              owner.activeTurn ||
+              owner.turnQueue?.some((turn) => !turn.settled) ||
+              owner.liveBackgroundTasks.size > 0
+            )
+              return;
+            try {
+              await this.prompt({
+                sessionId,
+                prompt: [{ type: "text", text: "/compact" }],
+                _meta: { idleCompaction: true },
+              });
+            } finally {
+              owner.aoeIdleCompaction?.invalidate();
+            }
+          },
+          (error) => this.logger.error(`Idle compaction failed: ${String(error)}`),
+        );
+        abortController.signal.addEventListener("abort", () => owner.aoeIdleCompaction?.invalidate(), {
+          once: true,
+        });
+      }
       timing.phase("register");
       this.backgroundWork.sync(
         sessionId,
