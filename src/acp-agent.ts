@@ -1,3 +1,4 @@
+import { IdleCompaction } from "./idle-compaction.js";
 import {
   agent as acpAgent,
   AgentApp,
@@ -995,6 +996,7 @@ type OpenUserInput = {
 };
 
 export type Session = {
+  idleCompaction?: IdleCompaction;
   query: Query;
   input: Pushable<SDKUserMessage>;
   /** Set by a cancel. While it is set, the consumer treats what arrives as the
@@ -3851,12 +3853,24 @@ export class ClaudeAcpAgent {
     }
 
     const userMessage = promptToClaude(params);
+    if (
+      params._meta?.idleCompaction === true &&
+      (session.activeTurn ||
+        session.turnQueue?.some((turn) => !turn.settled) ||
+        session.liveBackgroundTasks.size > 0)
+    ) {
+      throw new Error("Session became busy before idle compaction");
+    }
+    session.idleCompaction?.disarm();
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
 
     // Local-only commands (e.g. `/clear`) return a result without replaying the
     // user message, so the consumer can't promote the turn from the echo.
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    if (["/compact", "/clear"].includes(firstText.split(" ", 1)[0])) {
+      session.idleCompaction?.invalidate();
+    }
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
@@ -6913,6 +6927,11 @@ export class ClaudeAcpAgent {
             // The CLI predicts the next prompt right after this result, so a
             // `prompt_suggestion` from here on belongs to the turn just ended.
             session.promptSuggestionExpected = true;
+            if (message.subtype === "success") {
+              queueMicrotask(() => session.idleCompaction?.arm());
+            } else {
+              session.idleCompaction?.invalidate();
+            }
             outputTokens?.turnEnded();
             // The result ends the model turn. A background task that still
             // waits for its tool call id gets its spawn now, without the id.
@@ -7671,6 +7690,7 @@ export class ClaudeAcpAgent {
               (message.event.type === "message_start" || message.event.type === "message_delta")
             ) {
               if (message.event.type === "message_start") {
+                session.idleCompaction?.observe(message.event.message.usage, message.ttft_ms);
                 outputTokens?.messageStarted();
                 lastAssistantUsage = snapshotFromUsage(message.event.message.usage);
                 const model = message.event.message.model;
@@ -8702,6 +8722,7 @@ export class ClaudeAcpAgent {
       session.cancelledPrompts.add(turn.promptUuid);
       for (const uuid of turn.steeredUuids ?? []) session.cancelledPrompts.add(uuid);
     }
+    session.idleCompaction?.invalidate();
     for (const turn of session.turnQueue ?? []) turn.localCommandAbort?.abort();
     session.pendingExitPlanModeInterruption = undefined;
     session.pendingExitPlanContextReset = undefined;
@@ -9077,6 +9098,7 @@ export class ClaudeAcpAgent {
     for (const [sessionId, candidate] of Object.entries(this.sessions)) {
       if (candidate === session) this.sessionIndex.onOwnSessionChanged(sessionId);
     }
+    session.idleCompaction?.invalidate();
     session.consumer = undefined;
     session.contextCompaction = undefined;
     session.settingsManager.dispose();
@@ -10751,6 +10773,7 @@ export class ClaudeAcpAgent {
     configId: string,
     value: string,
   ): Promise<void> {
+    session.idleCompaction?.invalidate();
     if (configId === MODE_CONFIG_ID) {
       this.sessionModes.syncConfig(session, value);
     } else if (configId === MODEL_CONFIG_ID) {
@@ -11609,6 +11632,7 @@ export class ClaudeAcpAgent {
             hooks: [
               async (input) => {
                 if (input.hook_event_name === "PostCompact" && !input.agent_id) {
+                  this.sessions[sessionId]?.idleCompaction?.invalidate();
                   this.sessions[sessionId]?.contextCompaction?.recordSummary(input.compact_summary);
                 }
                 return { continue: true };
@@ -11957,6 +11981,36 @@ export class ClaudeAcpAgent {
         )?.kind,
         fileChangeReporter,
       };
+      const idleMinimum = Number(process.env.AOE_CLAUDE_IDLE_COMPACT_MIN_TOKENS);
+      if (Number.isSafeInteger(idleMinimum) && idleMinimum >= 100_000 && idleMinimum <= 1_000_000) {
+        const owner = this.sessions[sessionId];
+        owner.idleCompaction = new IdleCompaction(
+          idleMinimum,
+          async () => {
+            if (
+              this.sessions[sessionId] !== owner ||
+              owner.queryClosed ||
+              owner.activeTurn ||
+              owner.turnQueue?.some((turn) => !turn.settled) ||
+              owner.liveBackgroundTasks.size > 0
+            )
+              return;
+            try {
+              await this.prompt({
+                sessionId,
+                prompt: [{ type: "text", text: "/compact" }],
+                _meta: { idleCompaction: true },
+              });
+            } finally {
+              owner.idleCompaction?.invalidate();
+            }
+          },
+          (error) => this.logger.error(`Idle compaction failed: ${String(error)}`),
+        );
+        abortController.signal.addEventListener("abort", () => owner.idleCompaction?.invalidate(), {
+          once: true,
+        });
+      }
       timing.phase("register");
       this.refreshContextWindowInBackground(sessionId, this.sessions[sessionId]);
 
