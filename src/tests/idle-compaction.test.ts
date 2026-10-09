@@ -4,6 +4,24 @@ import { IdleCompaction } from "../idle-compaction.js";
 afterEach(() => vi.useRealTimers());
 
 describe("idle compaction", () => {
+  it("reports cache timing without enabling automatic compaction", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    const compact = vi.fn().mockResolvedValue(undefined);
+    const tracker = new IdleCompaction(Number.POSITIVE_INFINITY, compact, vi.fn());
+    tracker.observe(
+      {
+        input_tokens: 100,
+        cache_creation_input_tokens: 210_000,
+        cache_creation: { ephemeral_1h_input_tokens: 210_000 },
+      },
+      1_000,
+    );
+    expect(tracker.snapshot?.expiresAt).toBe(3_699_000);
+    tracker.arm();
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(compact).not.toHaveBeenCalled();
+  });
   it("uses request start, refreshes on hits, and compacts only once", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(100_000);

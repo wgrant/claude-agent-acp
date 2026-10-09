@@ -54,6 +54,7 @@ import {
   type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { SessionTitles } from "../session-titles.js";
+import { IdleCompaction } from "../idle-compaction.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
 import { initializeClient, makeMockQuery } from "./helpers.js";
@@ -17757,6 +17758,44 @@ describe("result origin handling", () => {
       "_claude/origin": { kind: "channel", server: "acp" },
       "_claude/model": "claude-sonnet-4-6",
     });
+  });
+
+  it("forwards observed request timing and TTL through usage metadata", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const usage = {
+      input_tokens: 100,
+      output_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 210000,
+      cache_creation: { ephemeral_1h_input_tokens: 210000 },
+    };
+    injectSession(agent, [
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        ttft_ms: 250,
+        event: {
+          type: "message_start",
+          message: { id: "cache-message", model: "claude-sonnet-4-6", usage },
+        },
+      },
+      createResult({ usage }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    agent.sessions["test-session"].idleCompaction = new IdleCompaction(
+      Infinity,
+      async () => {},
+      () => {},
+    );
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    const cache = updates.find((u: any) => u.update?._meta?.["_claude/prompt_cache"])?.update._meta[
+      "_claude/prompt_cache"
+    ];
+    expect(cache).toBeDefined();
+    expect(cache.expiresAt - cache.refreshedAt).toBe(3600000);
+    expect(cache.contextTokens).toBe(210100);
   });
 
   it("carries only the model in _meta when origin is absent", async () => {

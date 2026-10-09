@@ -4783,6 +4783,9 @@ export class ClaudeAcpAgent {
         _meta: {
           ...(update._meta ?? {}),
           "_claude/model": lastAssistantModel,
+          ...(session.idleCompaction?.snapshot && {
+            "_claude/prompt_cache": session.idleCompaction.snapshot,
+          }),
         },
       };
     };
@@ -11982,10 +11985,12 @@ export class ClaudeAcpAgent {
         fileChangeReporter,
       };
       const idleMinimum = Number(process.env.AOE_CLAUDE_IDLE_COMPACT_MIN_TOKENS);
-      if (Number.isSafeInteger(idleMinimum) && idleMinimum >= 100_000 && idleMinimum <= 1_000_000) {
+      {
         const owner = this.sessions[sessionId];
         owner.idleCompaction = new IdleCompaction(
-          idleMinimum,
+          Number.isSafeInteger(idleMinimum) && idleMinimum >= 100_000 && idleMinimum <= 1_000_000
+            ? idleMinimum
+            : Number.POSITIVE_INFINITY,
           async () => {
             if (
               this.sessions[sessionId] !== owner ||
