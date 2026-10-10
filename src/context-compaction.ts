@@ -1,6 +1,7 @@
 import { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import {
   ContextCompactionMetadata,
+  ContextCompactionTrigger,
   createContextCompactionMeta,
 } from "./context-compaction-meta.js";
 import { compactionToolCall } from "./tool-calls/reporters/compaction.js";
@@ -20,6 +21,7 @@ type TerminalStatus = CompactionStatus | "cancelled";
 export type CompactionPresentation = "tool_call" | "compaction_update";
 
 type CompactionState = {
+  trigger?: ContextCompactionTrigger;
   /** Doubles as the toolCallId under the legacy presentation. */
   compactionId: string;
   terminalStatus?: TerminalStatus;
@@ -40,8 +42,10 @@ export type ContextCompactionLifecycleOptions = {
   /** Receives failures of the send that must not propagate: the turn-boundary
    *  `cancelled` terminal. */
   logError?: (message: string, error: unknown) => void;
-  /** The client is AIR. Only AIR gets the compaction facts, under `_meta.jetbrains.air`. */
+  /** AIR receives facts under its own metadata namespace. */
   airClient?: boolean;
+  aoeClient?: boolean;
+  trigger?: () => ContextCompactionTrigger | undefined;
 };
 
 export function clientSupportsCompactionUpdates(capabilities?: ClientCapabilities | null): boolean {
@@ -157,6 +161,8 @@ export class ContextCompactionLifecycle {
   readonly presentation: CompactionPresentation;
   private readonly logError: (message: string, error: unknown) => void;
   private readonly airClient: boolean;
+  private readonly aoeClient: boolean;
+  private readonly trigger: () => ContextCompactionTrigger | undefined;
 
   constructor(
     private readonly sendUpdate: SendUpdate,
@@ -166,6 +172,8 @@ export class ContextCompactionLifecycle {
     this.presentation = options.presentation ?? "tool_call";
     this.logError = options.logError ?? (() => {});
     this.airClient = options.airClient ?? false;
+    this.aoeClient = options.aoeClient ?? false;
+    this.trigger = options.trigger ?? (() => undefined);
   }
 
   get hasDeliveredOutput(): boolean {
@@ -247,7 +255,9 @@ export class ContextCompactionLifecycle {
         sessionUpdate: "compaction_update",
         compactionId,
         status: "in_progress",
-        ...(this.airClient ? { _meta: createContextCompactionMeta() } : {}),
+        ...this.factsMeta(
+          this.activeCompaction?.trigger ? { trigger: this.activeCompaction.trigger } : {},
+        ),
       });
       return;
     }
@@ -333,7 +343,7 @@ export class ContextCompactionLifecycle {
       this.duplicateErrorOutput = metadata.error;
     }
     const terminalStatus = state.terminalStatus ?? status;
-    const hasMetadata = Object.keys(metadata).length > 0;
+    metadata = { ...metadata, ...(state.trigger ? { trigger: state.trigger } : {}) };
 
     if (this.presentation === "compaction_update") {
       // A summary that went out as chunks is not sent again in full. The
@@ -354,10 +364,7 @@ export class ContextCompactionLifecycle {
         // only re-send it when the boundary adds facts, so a status-only
         // duplicate can't wipe the token counts.
         // The standard `error` field carries the error, so `_meta` does not.
-        // Only AIR gets the compaction facts.
-        ...(this.airClient && (firstTerminal || hasMetadata)
-          ? { _meta: createContextCompactionMeta(withoutError(metadata)) }
-          : {}),
+        ...this.factsMeta(withoutError(metadata)),
       });
       return;
     }
@@ -378,6 +385,7 @@ export class ContextCompactionLifecycle {
   private open(compactionId: string, terminalStatus?: TerminalStatus): CompactionState {
     const state: CompactionState = {
       compactionId,
+      trigger: this.trigger(),
       heartbeatSent: false,
       ...(terminalStatus ? { terminalStatus } : {}),
       ...(this.pendingSummary !== undefined ? { summary: this.pendingSummary } : {}),
@@ -386,6 +394,15 @@ export class ContextCompactionLifecycle {
     this.activeCompaction = state;
     this.outputDelivered = true;
     return state;
+  }
+
+  private factsMeta(metadata: Omit<ContextCompactionMetadata, "version">): {
+    _meta?: Record<string, unknown>;
+  } {
+    if (this.airClient) return { _meta: createContextCompactionMeta(metadata) };
+    return this.aoeClient && Object.keys(metadata).length > 0
+      ? { _meta: { contextCompaction: { version: 1, ...metadata } } }
+      : {};
   }
 
   private send(update: SessionNotification["update"]): Promise<void> {

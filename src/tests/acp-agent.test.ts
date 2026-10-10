@@ -15073,6 +15073,54 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.size).toBe(1000000);
   });
 
+  it.each([
+    ["automatic", "test", undefined, "auto"],
+    ["manual", "/compact", undefined, "manual"],
+    ["idle", "/compact", { idleCompaction: true }, "manual"],
+  ] as const)(
+    "reports %s compaction measurements to a non-AIR client",
+    async (trigger, text, meta, nativeTrigger) => {
+      const { agent, updates } = createMockAgentWithCapture();
+      await initializeClient(agent, {
+        session: { compaction: {} },
+        _meta: { "aoe/sessionUpdates": [] },
+      });
+      injectSession(agent, [
+        {
+          type: "system",
+          subtype: "compact_boundary",
+          uuid: "boundary",
+          session_id: "test-session",
+          compact_metadata: {
+            trigger: nativeTrigger,
+            pre_tokens: 211057,
+            post_tokens: 2071,
+            duration_ms: 9406,
+          },
+        },
+      ]);
+      await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text }],
+        _meta: meta,
+      });
+      expect(updates.map((notification) => notification.update)).toContainEqual({
+        sessionUpdate: "compaction_update",
+        compactionId: "boundary",
+        status: "completed",
+        _meta: {
+          contextCompaction: {
+            version: 1,
+            trigger,
+            preTokens: 211057,
+            postTokens: 2071,
+            durationMs: 9406,
+          },
+        },
+      });
+    },
+  );
+
   it("compact_boundary uses post_tokens without waiting for getContextUsage", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
@@ -16298,7 +16346,11 @@ describe("assembled assistant text fallback", () => {
         _meta: expect.objectContaining({
           jetbrains: expect.objectContaining({
             air: expect.objectContaining({
-              contextCompaction: { version: 1, error: "Not enough messages to compact." },
+              contextCompaction: {
+                version: 1,
+                trigger: "manual",
+                error: "Not enough messages to compact.",
+              },
             }),
           }),
         }),
@@ -16424,13 +16476,17 @@ describe("assembled assistant text fallback", () => {
         sessionUpdate: "compaction_update",
         compactionId: "compact-start",
         status: "in_progress",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
+        _meta: {
+          jetbrains: { air: { version: 1, contextCompaction: { version: 1, trigger: "manual" } } },
+        },
       },
       {
         sessionUpdate: "compaction_update",
         compactionId: "compact-start",
         status: "completed",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
+        _meta: {
+          jetbrains: { air: { version: 1, contextCompaction: { version: 1, trigger: "manual" } } },
+        },
       },
       {
         sessionUpdate: "compaction_update",
@@ -16490,7 +16546,9 @@ describe("assembled assistant text fallback", () => {
         sessionUpdate: "compaction_update",
         compactionId: "compact-start",
         status: "in_progress",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
+        _meta: {
+          jetbrains: { air: { version: 1, contextCompaction: { version: 1, trigger: "manual" } } },
+        },
       },
       {
         sessionUpdate: "compaction_update",
@@ -16499,7 +16557,7 @@ describe("assembled assistant text fallback", () => {
         error: "summary rejected",
         // The standard error field carries the error once.
         _meta: {
-          jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } },
+          jetbrains: { air: { version: 1, contextCompaction: { version: 1, trigger: "manual" } } },
         },
       },
     ]);
@@ -17026,7 +17084,7 @@ describe("assembled assistant text fallback", () => {
       kind: "think",
       status: "completed",
       _meta: {
-        jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } },
+        jetbrains: { air: { version: 1, contextCompaction: { version: 1, trigger: "manual" } } },
       },
     });
     expect(messageChunkTexts(updates)).toEqual([]);
