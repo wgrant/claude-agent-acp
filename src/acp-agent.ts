@@ -829,6 +829,7 @@ type Turn = {
   /** The `ClaudeAcpAgent.promptsReceived` count when `startTurn()` received
    *  this prompt. `cancelTurns` cancels only turns received before the cancel. */
   received: number;
+  compactionTrigger?: "manual" | "idle";
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. It is also the
    *  id of the user message the turn reports as inserted. */
@@ -4113,6 +4114,12 @@ export class ClaudeAcpAgent {
     const turn: Turn = {
       received,
       promptUuid,
+      ...(firstText.split(" ", 1)[0] === "/compact"
+        ? {
+            compactionTrigger:
+              params._meta?.idleCompaction === true ? ("idle" as const) : ("manual" as const),
+          }
+        : {}),
       events,
       isLocalOnlyCommand,
       ...(localCommand ? { localCommand } : {}),
@@ -4830,6 +4837,8 @@ export class ClaudeAcpAgent {
 
     const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification), {
       sessionId: params.sessionId,
+      trigger: () => (session.activeTurn ?? firstUnsettledQueuedTurn())?.compactionTrigger,
+      aoeClient: Array.isArray(this.clientCapabilities?._meta?.["aoe/sessionUpdates"]),
       airClient: this.toolCallCapabilities.air.client,
       presentation: clientSupportsCompactionUpdates(this.clientCapabilities)
         ? "compaction_update"
