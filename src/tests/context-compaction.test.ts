@@ -18,6 +18,7 @@ function lifecycle(
   presentation: "tool_call" | "compaction_update",
   sendUpdate?: (notification: SessionNotification) => Promise<void>,
   airClient = true,
+  aoeClient = false,
 ) {
   const sent: SessionNotification["update"][] = [];
   const logError = vi.fn();
@@ -26,12 +27,43 @@ function lifecycle(
       (async (notification) => {
         sent.push(notification.update);
       }),
-    { sessionId: "s", presentation, logError, airClient },
+    { sessionId: "s", presentation, logError, airClient, aoeClient },
   );
   return { sent, compaction, logError };
 }
 
 describe("ContextCompactionLifecycle for a client that is not AIR", () => {
+  it("keeps the idle origin through terminal enrichment and clears it for the next compaction", async () => {
+    let trigger: "idle" | undefined = "idle";
+    const sent: SessionNotification["update"][] = [];
+    const compaction = new ContextCompactionLifecycle(
+      async ({ update }) => {
+        sent.push(update);
+      },
+      {
+        sessionId: "s",
+        presentation: "compaction_update",
+        aoeClient: true,
+        trigger: () => trigger,
+      },
+    );
+    await compaction.start("idle");
+    await compaction.finish("idle", "completed");
+    trigger = undefined;
+    await compaction.finish(
+      "idle",
+      "completed",
+      { trigger: "manual", preTokens: 211057, postTokens: 2071 },
+      true,
+    );
+    expect(sent.at(-1)?._meta).toEqual({
+      contextCompaction: { version: 1, trigger: "idle", preTokens: 211057, postTokens: 2071 },
+    });
+    await compaction.reset();
+    await compaction.finish("auto", "completed", { trigger: "automatic" });
+    expect(sent.at(-1)?._meta).toEqual({ contextCompaction: { version: 1, trigger: "automatic" } });
+  });
+
   it("sends the upstream tool call fields and no AIR key", async () => {
     const { sent, compaction } = lifecycle("tool_call", undefined, false);
     await compaction.start("c");
@@ -55,8 +87,8 @@ describe("ContextCompactionLifecycle for a client that is not AIR", () => {
     ]);
   });
 
-  it("sends compaction updates without _meta, and a summary that differs from the chunks", async () => {
-    const { sent, compaction } = lifecycle("compaction_update", undefined, false);
+  it("sends portable compaction facts and a summary that differs from the chunks", async () => {
+    const { sent, compaction } = lifecycle("compaction_update", undefined, false, true);
     await compaction.start("c");
     await compaction.heartbeat("c", "Part");
     compaction.recordSummary("<summary>\nThe whole summary\n</summary>");
@@ -73,6 +105,7 @@ describe("ContextCompactionLifecycle for a client that is not AIR", () => {
         compactionId: "c",
         status: "completed",
         summary: [{ type: "text", text: "The whole summary" }],
+        _meta: { contextCompaction: { version: 1, trigger: "manual" } },
       },
     ]);
   });
