@@ -395,7 +395,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
   it("routes a teammate woken by SendMessage to its new generation", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
-      true,
+      "air",
       "root",
       {},
       async (notification) => {

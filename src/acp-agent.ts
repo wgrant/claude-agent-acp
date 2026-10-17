@@ -66,6 +66,7 @@ import {
   FastModeState,
   filterEscalatingDefaultMode,
   getSessionMessages,
+  getSubagentMessages,
   HookCallback,
   listSessions,
   McpServerConfig,
@@ -7809,7 +7810,8 @@ export class ClaudeAcpAgent {
               const delta = message.event.delta;
               if (message.parent_tool_use_id === null) {
                 if (delta.type === "text_delta") await outputTokens?.streamed(delta.text);
-                if (delta.type === "input_json_delta") await outputTokens?.streamed(delta.partial_json);
+                if (delta.type === "input_json_delta")
+                  await outputTokens?.streamed(delta.partial_json);
               }
               const chunk =
                 delta.type === "text_delta"
@@ -8491,7 +8493,10 @@ export class ClaudeAcpAgent {
             break;
           case "prompt_suggestion": {
             if (clientWantsUpdate(this.clientCapabilities, "prompt_suggestion")) {
-              await sendUpdate({sessionId: message.session_id, update: aoeUpdate("prompt_suggestion", {suggestion: message.suggestion})});
+              await sendUpdate({
+                sessionId: message.session_id,
+                update: aoeUpdate("prompt_suggestion", { suggestion: message.suggestion }),
+              });
             }
             // The CLI predicts the next prompt after the turn's `result`. AIR
             // shows it as gray text in an empty composer; Tab fills the
