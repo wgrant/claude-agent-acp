@@ -61,6 +61,59 @@ function control(
 }
 
 describe("NativeSubagentRuntime lifecycle", () => {
+  it.each(["air", "rfd"] as const)(
+    "routes a workflow child with phase metadata and finishes it in %s form",
+    async (form) => {
+      const published: AcpSessionNotification[] = [];
+      const publish = async (notification: AcpSessionNotification) => {
+        published.push(notification);
+      };
+      const runtime = new NativeSubagentRuntime(form, "root", {}, publish, { log() {} });
+      const workflow = { id: "wf-task", phase: "Classify", model: "haiku" };
+      const parent = await runtime.workflowAgentStarted(
+        "agent-a",
+        workflow,
+        "batch-1",
+        "Inspect tests",
+        publish,
+      );
+      await runtime.workflowAgentStarted("agent-a", workflow, "batch-1", "Inspect tests", publish);
+      expect(
+        published.filter(
+          (entry) =>
+            entry.update.sessionUpdate ===
+            (form === "air" ? "subagent_spawned" : "subagent_update"),
+        ),
+      ).toHaveLength(1);
+      expect(published[0]!.update._meta).toMatchObject({ claudeCode: { workflow } });
+      const routed = await runtime.route(
+        {
+          sessionId: "root",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Classified" },
+            _meta: { claudeCode: { parentToolUseId: parent } },
+          },
+        },
+        publish,
+      );
+      expect(routed?.sessionId).toBe("workflow:wf-task:agent-a");
+      await runtime.finishTask("agent-a", "completed", publish, undefined, {
+        result: "Three flakes classified",
+      });
+      expect(published.at(-1)?.update._meta).toMatchObject({
+        claudeCode: { result: "Three flakes classified" },
+      });
+      expect(published.at(-1)?.update).toMatchObject(
+        form === "air"
+          ? {
+              sessionUpdate: "subagent_state_update",
+              state: "completed",
+            }
+          : { sessionUpdate: "subagent_update", state: { state: "idle" } },
+      );
+    },
+  );
   it("publishes a raced spawn exactly once", async () => {
     const release = deferred();
     const published: AcpSessionNotification[] = [];

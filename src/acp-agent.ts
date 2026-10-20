@@ -309,6 +309,7 @@ import {
 } from "./tool-calls/renderer.js";
 import { resolveSkillPath, type SkillScanCache } from "./tool-calls/reporters/interaction.js";
 import { ForkTranscript } from "./fork-transcripts.js";
+import { workflowSource, WorkflowWatcher } from "./workflow-agents.js";
 import {
   startTerminalTail,
   stopSessionTails,
@@ -4680,6 +4681,113 @@ export class ClaudeAcpAgent {
     const routedNotificationClient = { sessionUpdate: sendUpdate } as unknown as AcpClient;
     session.nativeSubagentDeliver = sendUpdate;
     const forkTranscripts = new Map<string, ForkTranscript>();
+    const workflowDirectories = new Map<string, string>();
+    const finishedWorkflows = new Set<string>();
+    const workflows = new Map<
+      string,
+      {
+        sdkSessionId: string;
+        toolUseId?: string;
+        watcher?: WorkflowWatcher;
+        starting?: Promise<void>;
+        finished?: boolean;
+      }
+    >();
+    const pollWorkflow = async (taskId: string) => {
+      const run = workflows.get(taskId);
+      const directory = run?.toolUseId ? workflowDirectories.get(run.toolUseId) : undefined;
+      if (!run || run.finished || !directory || !subagents.enabled) return;
+      run.starting ??= (async () => {
+        if (run.watcher) return;
+        const source = await workflowSource(run.sdkSessionId, session.cwd, directory);
+        if (!source || run.finished) return;
+        const parents = new Map<string, string>();
+        const key = (id: string) => id;
+        let limitReported = false;
+        run.watcher = new WorkflowWatcher(source, {
+          spawn: async (agent, prompt) => {
+            const parent = await subagents.workflowAgentStarted(
+              key(agent.id),
+              {
+                id: taskId,
+                phase: agent.phase,
+                model: agent.model,
+              },
+              agent.label ?? "Workflow agent",
+              prompt,
+              sendUpdate,
+            );
+            if (!parent) {
+              if (!limitReported) {
+                limitReported = true;
+                await sendUpdate({
+                  sessionId: params.sessionId,
+                  update: noticeOrTranscriptUpdate(
+                    {
+                      severity: "warning",
+                      title: "Workflow agent display limit reached",
+                      description:
+                        "Up to 256 active native agents can be shown. Additional agents continue running; workflow activity and total usage are still reported.",
+                    },
+                    supportsNotices,
+                  ),
+                });
+              }
+              return false;
+            }
+            parents.set(agent.id, parent);
+            return true;
+          },
+          message: async (agent, message) => {
+            const raw = (message.message as { content?: unknown })?.content;
+            const content = typeof raw === "string" ? [{ type: "text", text: raw }] : raw;
+            if (!Array.isArray(content)) return;
+            if (message.type === "user" && !content.some((block) => block?.type === "tool_result"))
+              return;
+            for (const notification of toAcpNotifications(
+              content,
+              message.type === "user" ? "user" : "assistant",
+              params.sessionId,
+              session.toolUseCache,
+              routedNotificationClient,
+              this.logger,
+              {
+                clientCapabilities: this.clientCapabilities,
+                parentToolUseId: parents.get(agent.id),
+                cwd: session.cwd,
+                emittedToolCalls: session.emittedToolCalls,
+                registerHooks: false,
+                messageId: message.uuid,
+              },
+            ))
+              await sendUpdate(notification);
+          },
+          finish: async (agent, state) => {
+            await subagents.finishTask(key(agent.id), state, sendUpdate, undefined, {
+              result: agent.result,
+            });
+          },
+        });
+      })();
+      try {
+        await run.starting;
+      } finally {
+        run.starting = undefined;
+      }
+      await run.watcher?.poll();
+    };
+    const finishWorkflow = async (taskId: string, status: string, runId?: string) => {
+      finishedWorkflows.add(`${taskId}\0${runId ?? ""}`);
+      const run = workflows.get(taskId);
+      if (!run) return;
+      await pollWorkflow(taskId);
+      run.finished = true;
+      await run.watcher?.finish(
+        status === "completed" ? "completed" : status === "failed" ? "failed" : "cancelled",
+      );
+      workflows.delete(taskId);
+      if (run.toolUseId) workflowDirectories.delete(run.toolUseId);
+    };
     // Awaited in the message loop so the fork's final reply precedes its
     // child's finish and the Skill result that ends the parent's wait for it.
     // The wait is bounded and usually one read.
@@ -4696,6 +4804,15 @@ export class ClaudeAcpAgent {
     ): Promise<void> => {
       for (const transcript of forkTranscripts.values()) transcript.cancel();
       forkTranscripts.clear();
+      await Promise.all(
+        [...workflows.values()].map(async (run) => {
+          run.finished = true;
+          await run.starting;
+          await run.watcher?.cancel();
+        }),
+      );
+      workflows.clear();
+      workflowDirectories.clear();
       stopSessionTails(params.sessionId);
       await compaction.interrupt();
       await Promise.all([
@@ -6527,6 +6644,7 @@ export class ClaudeAcpAgent {
                   usage: message.usage,
                   tool_use_id: message.tool_use_id,
                 });
+                await pollWorkflow(message.task_id);
                 break;
               case "task_started":
                 if (isLateTaskRun(session, message.task_id, message.run_id)) {
@@ -6627,6 +6745,17 @@ export class ClaudeAcpAgent {
                   skip_transcript: message.skip_transcript,
                   tool_use_id: message.tool_use_id,
                 });
+                if (
+                  message.task_type === "local_workflow" &&
+                  !workflows.has(message.task_id) &&
+                  !finishedWorkflows.has(`${message.task_id}\0${message.run_id ?? ""}`)
+                ) {
+                  workflows.set(message.task_id, {
+                    sdkSessionId: message.session_id,
+                    toolUseId: message.tool_use_id,
+                  });
+                  await pollWorkflow(message.task_id);
+                }
                 break;
               case "task_notification":
                 if (isLateTaskRun(session, message.task_id, message.run_id)) {
@@ -6642,6 +6771,7 @@ export class ClaudeAcpAgent {
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 await finishForkTranscript(message.task_id, message.status);
+                await finishWorkflow(message.task_id, message.status, message.run_id);
                 await subagents.finishTask(
                   message.task_id,
                   message.status,
@@ -6694,6 +6824,7 @@ export class ClaudeAcpAgent {
                   message.patch.status === "killed"
                 ) {
                   await finishForkTranscript(message.task_id, message.patch.status);
+                  await finishWorkflow(message.task_id, message.patch.status, message.run_id);
                   await subagents.finishTask(
                     message.task_id,
                     message.patch.status,
@@ -8288,6 +8419,26 @@ export class ClaudeAcpAgent {
                 });
               }
               await asyncTasks.toolResults(content);
+              for (const block of content) {
+                if (
+                  typeof block !== "object" ||
+                  block.type !== "tool_result" ||
+                  session.toolUseCache[block.tool_use_id]?.name !== "Workflow"
+                )
+                  continue;
+                const text =
+                  typeof block.content === "string"
+                    ? block.content
+                    : Array.isArray(block.content)
+                      ? block.content
+                          .filter((part) => part.type === "text")
+                          .map((part) => part.text)
+                          .join("\n")
+                      : "";
+                const directory = /^Transcript dir: (.+)$/m.exec(text)?.[1]?.trim();
+                if (directory) workflowDirectories.set(block.tool_use_id, directory);
+              }
+              for (const taskId of workflows.keys()) await pollWorkflow(taskId);
               backgroundedToolCalls = backgroundedBashToolCallIds(
                 content,
                 session.toolUseCache,

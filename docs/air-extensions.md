@@ -1271,6 +1271,19 @@ This section covers only the AIR bridge.
   Child interactions stay on the root session.
 - A client that uses the older `_meta["subagent-transcript"]` capability or the `forwardSubagentText` session option keeps the flat child transcript.
 
+Workflow agents use the same child sessions. Their spawn carries
+`_meta.claudeCode.workflow: {id, phase?, model?}`, where `id` is the owning async
+workflow task. The adapter binds that task to the transcript directory reported
+by its Workflow tool call, then reads messages through the SDK. Optional CLI
+metadata and journal entries supply labels, phases and completion; without them,
+labels come from prompts and children remain running until the workflow ends.
+No individual cancellation capability is advertised for these children.
+At most 256 native agents can be active at once; exceeding that display limit
+produces a warning without stopping the workflow.
+When available, the terminal state carries a short journal result in
+`_meta.claudeCode.result`. If the run directory cannot be validated inside the
+session's workflow history, no children are attributed to it.
+
 ## Session index
 
 The session index makes `session/list` a bounded, ordered page with row metadata, and adds rename, archive and a list subscription.
