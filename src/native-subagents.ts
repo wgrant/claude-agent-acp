@@ -16,6 +16,8 @@ export type WorkState = NonNullable<
 >;
 
 export type NativeSubagent = {
+  result?: string;
+  workflow?: { id: string; phase?: string; model?: string };
   sessionId: string;
   parentSessionId: string;
   parentToolUseId?: string;
@@ -116,6 +118,7 @@ type ChildConfiguration = {
 
 /** What the SDK says about the end of a task, beyond its status. */
 export type TaskEnd = {
+  result?: string;
   /** The SDK's text for a failure. */
   error?: string;
   /** The SDK's reason for an unusual end, such as `worker_restart`. */
@@ -743,6 +746,49 @@ export class NativeSubagentRuntime {
     );
   }
 
+  /** Workflow agents have no SDK task edges or launching Agent frame. */
+  async workflowAgentStarted(
+    taskId: string,
+    workflow: NonNullable<NativeSubagent["workflow"]>,
+    label: string,
+    prompt: string | undefined,
+    deliver: Publish,
+  ): Promise<string | undefined> {
+    if (!this.enabled) return undefined;
+    const known = this.children.get(taskId);
+    if (
+      known &&
+      (this.form === "rfd" ? known.workState !== "idle" : known.terminalState === undefined)
+    )
+      return known.parentToolUseId;
+    const running = [...this.children.values()].filter((child) =>
+      this.form === "rfd" ? child.workState !== "idle" : child.terminalState === undefined,
+    ).length;
+    if (running >= 256) return undefined;
+    const parentToolUseId = `workflow-agent:${taskId}`;
+    await this.openGeneration(
+      taskId,
+      known,
+      {
+        parentSessionId: this.rootSessionId,
+        parentToolUseId,
+        name: label,
+        task: prompt ?? label,
+        title: label,
+        description: prompt ?? label,
+        ...promptField(prompt),
+      },
+      false,
+      deliver,
+    );
+    const child = this.children.get(taskId)!;
+    // A resumed workflow can reuse a cached SDK agent under a different task.
+    child.sessionId = `workflow:${workflow.id}:${child.sessionId}`;
+    child.workflow = workflow;
+    await this.announce(child);
+    return parentToolUseId;
+  }
+
   /**
    * Opens a new generation of a finished child when the SDK resumes the same
    * agent id. The SDK can resume a child without a new `task_started`, so a
@@ -862,6 +908,7 @@ export class NativeSubagentRuntime {
     const child = toolUseId ? this.childByParentToolUse.get(toolUseId) : this.children.get(taskId);
     if (child && toolUseId && this.taskByToolUse.get(toolUseId) !== taskId) return;
     if (!state || !child) return;
+    if (child.workflow && end?.result !== undefined) child.result = end.result;
     if (this.form === "rfd") {
       if (this.isStaleEnd(taskId, toolUseId)) return;
       if (!child.announced && !child.announcePromise) {
@@ -1300,7 +1347,12 @@ export class NativeSubagentRuntime {
     child.missingError = false;
     await this.publish({
       sessionId: child.parentSessionId,
-      update: { sessionUpdate: "subagent_update", sessionId: child.sessionId, state },
+      update: {
+        sessionUpdate: "subagent_update",
+        sessionId: child.sessionId,
+        state,
+        ...(child.result !== undefined ? { _meta: { claudeCode: { result: child.result } } } : {}),
+      },
     });
   }
 
@@ -1788,7 +1840,8 @@ export async function announceNativeSubagent(
           ...(child.title ? { title: child.title } : {}),
           ...(child.description ? { description: child.description } : {}),
           ...(cwd ? { cwd } : {}),
-          capabilities: { cancel: {} },
+          capabilities: child.workflow ? {} : { cancel: {} },
+          ...(child.workflow ? { _meta: { claudeCode: { workflow: child.workflow } } } : {}),
           state: { state: "running" },
         },
       });
@@ -1816,7 +1869,16 @@ export async function announceNativeSubagent(
         task: child.task,
         ...promptField(child.prompt),
         capabilities: {},
-        ...(child.teammate ? { _meta: { claudeCode: { teammate: true } } } : {}),
+        ...(child.teammate || child.workflow
+          ? {
+              _meta: {
+                claudeCode: {
+                  ...(child.teammate ? { teammate: true } : {}),
+                  ...(child.workflow ? { workflow: child.workflow } : {}),
+                },
+              },
+            }
+          : {}),
       },
     });
     child.announced = true;
@@ -1846,6 +1908,7 @@ export async function finishNativeSubagent(
         sessionUpdate: "subagent_state_update",
         subagentSessionId: child.sessionId,
         state,
+        ...(child.result !== undefined ? { _meta: { claudeCode: { result: child.result } } } : {}),
       },
     });
     child.terminalState = state;
