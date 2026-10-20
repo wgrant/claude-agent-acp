@@ -98,6 +98,7 @@ interface Child {
   offset: number;
   seen: Set<string>;
   ended: boolean;
+  finalReply: boolean;
 }
 
 export class WorkflowWatcher {
@@ -146,7 +147,7 @@ export class WorkflowWatcher {
           { model?: unknown } | undefined;
         agent.model ??= typeof model?.model === "string" ? model.model : undefined;
         if (!(await this.callbacks.spawn(agent, text))) continue;
-        child = { agent, offset: 0, seen: new Set(), ended: false };
+        child = { agent, offset: 0, seen: new Set(), ended: false, finalReply: false };
         this.children.set(agent.id, child);
       }
       if (child.ended) continue;
@@ -159,6 +160,16 @@ export class WorkflowWatcher {
           if (this.stopped) return;
           if (!child.seen.has(message.uuid)) {
             await this.callbacks.message(child.agent, message);
+            const content = (message.message as { content?: unknown })?.content;
+            child.finalReply =
+              message.type === "assistant" &&
+              (typeof content === "string"
+                ? content.trim().length > 0
+                : Array.isArray(content) &&
+                  content.some((block) => block?.type === "text") &&
+                  !content.some((block) =>
+                    ["tool_use", "server_tool_use", "mcp_tool_use"].includes(block?.type),
+                  ));
             child.seen.add(message.uuid);
             if (child.seen.size > 2048) child.seen.delete(child.seen.values().next().value!);
           }
@@ -180,7 +191,10 @@ export class WorkflowWatcher {
     this.stopped = true;
     for (const child of this.children.values()) {
       if (!child.ended) {
-        await this.callbacks.finish(child.agent, state);
+        await this.callbacks.finish(
+          child.agent,
+          state === "completed" && !child.finalReply ? "disconnected" : state,
+        );
         child.ended = true;
       }
     }
