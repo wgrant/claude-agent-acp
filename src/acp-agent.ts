@@ -6644,7 +6644,9 @@ export class ClaudeAcpAgent {
                   usage: message.usage,
                   tool_use_id: message.tool_use_id,
                 });
-                await pollWorkflow(message.task_id);
+                void pollWorkflow(message.task_id).catch((error) =>
+                  this.logger.error("Workflow discovery failed", error),
+                );
                 break;
               case "task_started":
                 if (isLateTaskRun(session, message.task_id, message.run_id)) {

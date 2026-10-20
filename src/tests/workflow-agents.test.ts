@@ -78,6 +78,22 @@ it("cancels an in-flight read without announcing or delivering late children", a
   expect(callbacks.spawn).not.toHaveBeenCalled();
 });
 
+it("does not claim unfinished agents succeeded just because their workflow completed", async () => {
+  const finish = vi.fn(async (_agent: WorkflowAgent, _state: string) => {});
+  const watcher = new WorkflowWatcher(
+    {
+      agents: async () => [{ id: "done" }, { id: "unknown" }],
+      messages: async (id, offset) => (offset ? [] : id === "done" ? [msg("reply", "Done")] : []),
+    },
+    { spawn: async () => true, message: async () => {}, finish },
+  );
+  await watcher.finish("completed");
+  expect(finish.mock.calls.map(([agent, state]) => [agent.id, state])).toEqual([
+    ["done", "completed"],
+    ["unknown", "disconnected"],
+  ]);
+});
+
 it("scopes SDK agents to the tool's run directory and tolerates missing or damaged optional metadata", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "workflow-agents-"));
   try {
