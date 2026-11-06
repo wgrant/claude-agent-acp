@@ -190,6 +190,7 @@ function scriptClaudeCode({
         if (responseTakesMs !== undefined) {
           yield {
             type: "stream_event",
+            ttft_ms: 250,
             event: {
               type: "message_start",
               message: { id, role: "assistant", model: "claude-sonnet-4-6", content: [], usage },
@@ -249,6 +250,27 @@ async function promptHi(agent: ClaudeAcpAgent, id: string) {
 }
 
 describe("idle compaction in the agent", () => {
+  it.each([
+    [undefined, true],
+    ["", false],
+    ["100000", true],
+  ])(
+    "honors the AoE threshold override %s without a second scheduler",
+    async (threshold, compacts) => {
+      vi.stubEnv("AOE_CLAUDE_IDLE_COMPACT_MIN_TOKENS", threshold);
+      const claude = scriptClaudeCode({ responseTakesMs: 0 });
+      const { agent, sessionId } = await connect();
+      try {
+        await promptHi(agent, sessionId);
+        await claude.untilIdle();
+        await vi.advanceTimersByTimeAsync(55 * MINUTE_MS);
+        expect(claude.received).toEqual(compacts ? ["hi", "/compact"] : ["hi"]);
+      } finally {
+        await agent.dispose();
+      }
+    },
+  );
+
   /** Idle after a large 1h request: `/compact` goes into the input at 54 minutes, not before. */
   it("compacts an idle session with a large context shortly before its one-hour cache expires, with no client prompt", async () => {
     const claude = scriptClaudeCode();

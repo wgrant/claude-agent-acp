@@ -4119,7 +4119,9 @@ export class ClaudeAcpAgent {
       ...(firstText.split(" ", 1)[0] === "/compact"
         ? {
             compactionTrigger:
-              params._meta?.idleCompaction === true ? ("idle" as const) : ("manual" as const),
+              origin === "idleCompaction" || params._meta?.idleCompaction === true
+                ? ("idle" as const)
+                : ("manual" as const),
           }
         : {}),
       events,
@@ -4625,6 +4627,7 @@ export class ClaudeAcpAgent {
     // time the consumer next runs, and an unmarked result would settle the turn
     // (see Turn.steeredEchoes).
     session.idleCompaction?.disarm("steer");
+    session.aoeIdleCompaction?.disarm();
     (turnInFlight.steeredEchoes ??= new Set()).add(steeredUuid);
     (turnInFlight.steeredUuids ??= new Set()).add(steeredUuid);
     // A turn already held for background subagents has a recorded outcome the
@@ -5176,8 +5179,8 @@ export class ClaudeAcpAgent {
         _meta: {
           ...(update._meta ?? {}),
           "_claude/model": lastAssistantModel,
-          ...(session.idleCompaction?.snapshot && {
-            "_claude/prompt_cache": session.idleCompaction.snapshot,
+          ...(session.aoeIdleCompaction?.snapshot && {
+            "_claude/prompt_cache": session.aoeIdleCompaction.snapshot,
           }),
         },
       };
@@ -12568,7 +12571,7 @@ export class ClaudeAcpAgent {
           env: { ...configuredSettingsObject?.env, ...providerEnv },
         }
       : configuredSettingsObject;
-    const env = {
+    const env: Record<string, string | undefined> = {
       ...process.env,
       ...userProvidedOptions?.env,
       // Client-managed LLM routing: `providers/set` config wins, else the
@@ -13144,27 +13147,30 @@ export class ClaudeAcpAgent {
         fileChangeReporter,
       };
       const registered = this.sessions[sessionId];
-      registered.idleCompaction = new IdleCompaction(
-        {
-          // `openUserInputs` also covers permission requests: `requestPermission`
-          // is wrapped in `withPendingUserInput`.
-          isBusy: () =>
-            this.claudeIsWorking(sessionId, registered) ||
-            (registered.openUserInputs?.size ?? 0) > 0,
-          contextTokens: () => registered.contextUsedTokens,
-          settings: () => registered.settingsManager.getSettings(),
-          compact: () =>
-            this.prompt(
-              { sessionId, prompt: [{ type: "text", text: "/compact" }] },
-              "idleCompaction",
-            ),
-          // The logger has no debug level.
-          log: (message) => this.logger.log(message),
-        },
-        // The CLI's own environment: process env, the client's and the provider's.
-        { env },
-      );
-      const idleMinimum = Number(process.env.AOE_CLAUDE_IDLE_COMPACT_MIN_TOKENS);
+      // AoE owns its opt-in threshold, including an explicit empty value to disable it.
+      if (env.AOE_CLAUDE_IDLE_COMPACT_MIN_TOKENS === undefined) {
+        registered.idleCompaction = new IdleCompaction(
+          {
+            // `openUserInputs` also covers permission requests: `requestPermission`
+            // is wrapped in `withPendingUserInput`.
+            isBusy: () =>
+              this.claudeIsWorking(sessionId, registered) ||
+              (registered.openUserInputs?.size ?? 0) > 0,
+            contextTokens: () => registered.contextUsedTokens,
+            settings: () => registered.settingsManager.getSettings(),
+            compact: () =>
+              this.prompt(
+                { sessionId, prompt: [{ type: "text", text: "/compact" }] },
+                "idleCompaction",
+              ),
+            // The logger has no debug level.
+            log: (message) => this.logger.log(message),
+          },
+          // The CLI's own environment: process env, the client's and the provider's.
+          { env },
+        );
+      }
+      const idleMinimum = Number(env.AOE_CLAUDE_IDLE_COMPACT_MIN_TOKENS);
       {
         const owner = this.sessions[sessionId];
         owner.aoeIdleCompaction = new AoeIdleCompaction(
@@ -13175,26 +13181,32 @@ export class ClaudeAcpAgent {
             if (
               this.sessions[sessionId] !== owner ||
               owner.queryClosed ||
-              owner.activeTurn ||
-              owner.turnQueue?.some((turn) => !turn.settled) ||
-              owner.liveBackgroundTasks.size > 0
+              this.claudeIsWorking(sessionId, owner) ||
+              (owner.openUserInputs?.size ?? 0) > 0
             )
               return;
             try {
-              await this.prompt({
-                sessionId,
-                prompt: [{ type: "text", text: "/compact" }],
-                _meta: { idleCompaction: true },
-              });
+              await this.prompt(
+                {
+                  sessionId,
+                  prompt: [{ type: "text", text: "/compact" }],
+                  _meta: { idleCompaction: true },
+                },
+                "idleCompaction",
+              );
             } finally {
               owner.aoeIdleCompaction?.invalidate();
             }
           },
           (error) => this.logger.error(`Idle compaction failed: ${String(error)}`),
         );
-        abortController.signal.addEventListener("abort", () => owner.aoeIdleCompaction?.invalidate(), {
-          once: true,
-        });
+        abortController.signal.addEventListener(
+          "abort",
+          () => owner.aoeIdleCompaction?.invalidate(),
+          {
+            once: true,
+          },
+        );
       }
       timing.phase("register");
       this.backgroundWork.sync(

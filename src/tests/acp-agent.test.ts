@@ -19646,7 +19646,7 @@ describe("result origin handling", () => {
       createResult({ usage }),
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
-    agent.sessions["test-session"].idleCompaction = new IdleCompaction(
+    agent.sessions["test-session"].aoeIdleCompaction = new IdleCompaction(
       Infinity,
       async () => {},
       () => {},
